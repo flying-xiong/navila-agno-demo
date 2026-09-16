@@ -1,0 +1,320 @@
+"""Robot interfaces plus deterministic simulated and Go2 HTTP adapters."""
+from __future__ import annotations
+
+import math
+import os
+from collections import deque
+from pathlib import Path
+from typing import Any, Protocol
+
+from .contracts import MidLevelAction, RobotState, SubGoal
+
+
+class RobotInterface(Protocol):
+    def begin_subgoal(self, subgoal: SubGoal) -> None: ...
+
+    def observe(self) -> RobotState: ...
+
+    def execute(self, action: MidLevelAction) -> RobotState: ...
+
+    def recent_frames(self, n: int) -> list[str]: ...
+
+    def is_complete(self, subgoal: SubGoal, state: RobotState) -> bool: ...
+
+    def mark_complete(self) -> None: ...
+
+
+class MockRobot:
+    """A tiny 1-D navigation simulation.
+
+    It keeps a frame ring buffer and can be told to become blocked on a given
+    subgoal to demonstrate event-driven replanning.
+    """
+
+    def __init__(self, fail_subgoal_id: str | None = None, fail_after_steps: int = 2) -> None:
+        self.fail_subgoal_id = fail_subgoal_id
+        self.fail_after_steps = fail_after_steps
+        self.current_subgoal: SubGoal | None = None
+        self.step = 0
+        self.remaining_distance_m = 0.0
+        self.complete = False
+        self._frames: deque[str] = deque([f"mock://frame/{self.step}"], maxlen=32)
+
+    def begin_subgoal(self, subgoal: SubGoal) -> None:
+        self.current_subgoal = subgoal
+        self.step = 0
+        self.complete = False
+        self.remaining_distance_m = subgoal.estimated_distance_m or 1.0
+        self._frames.clear()
+        self._frames.append(f"mock://frame/{self.step}")
+
+    def observe(self) -> RobotState:
+        obstacle = (
+            self.fail_subgoal_id is not None
+            and self.current_subgoal is not None
+            and self.current_subgoal.id == self.fail_subgoal_id
+            and self.step >= self.fail_after_steps
+        )
+        return RobotState(
+            position={"x": self.step, "floor": "unknown"},
+            battery=0.82,
+            mode="navigating" if not self.complete else "idle",
+            frame_path=self._frames[-1],
+            obstacle=obstacle,
+            remaining_distance_m=self.remaining_distance_m,
+        )
+
+    def execute(self, action: MidLevelAction) -> RobotState:
+        if action.action_type in {"move_forward", "move"}:
+            self.remaining_distance_m = max(
+                0.0, self.remaining_distance_m - max(action.distance_m, 0.0)
+            )
+        self.step += 1
+        self._frames.append(f"mock://frame/{self.step}")
+        return self.observe()
+
+    def recent_frames(self, n: int) -> list[str]:
+        return list(self._frames)[-n:]
+
+    def is_complete(self, subgoal: SubGoal, state: RobotState) -> bool:
+        return self.complete or state.remaining_distance_m <= 0.05
+
+    def mark_complete(self) -> None:
+        self.complete = True
+        self.remaining_distance_m = 0.0
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def action_to_go2_command(
+    action: MidLevelAction,
+    forward_speed_mps: float = 0.30,
+    max_linear_speed_mps: float = 0.50,
+    max_lateral_speed_mps: float = 0.30,
+    max_yaw_speed_deg_per_s: float = 80.0,
+    waypoint_duration_s: float = 0.50,
+) -> dict[str, float]:
+    """Convert a mid-level action to a Go2 SportClient twist command.
+
+    ``move`` actions are waypoint displacements in LightNav-0 convention:
+    forward meters, left-positive lateral meters, left-positive yaw degrees.
+    The official LightNav deployment normalises displacements by 0.375 m and
+    yaw by 9 degrees, which is preserved here before velocity clamping.
+    """
+    if action.action_type == "stop":
+        return {"vx": 0.0, "vy": 0.0, "vyaw": 0.0, "duration_sec": 0.0}
+
+    if action.action_type == "move":
+        vx = max(-1.0, min(1.0, action.distance_m / 0.375)) * max_linear_speed_mps
+        vy = max(-1.0, min(1.0, action.lateral_m / 0.375)) * max_lateral_speed_mps
+        vyaw = max(-1.0, min(1.0, action.angle_deg / 9.0)) * max_yaw_speed_deg_per_s
+        return {
+            "vx": vx,
+            "vy": vy,
+            "vyaw": vyaw,
+            "duration_sec": waypoint_duration_s,
+        }
+
+    if action.action_type == "move_forward":
+        distance = max(action.distance_m, 0.0)
+        speed = max(0.05, min(forward_speed_mps, max_linear_speed_mps))
+        return {
+            "vx": speed,
+            "vy": 0.0,
+            "vyaw": 0.0,
+            "duration_sec": max(0.1, min(5.0, distance / speed)),
+        }
+
+    if action.action_type in {"turn_left", "turn_right"}:
+        direction = -1.0 if action.action_type == "turn_left" else 1.0
+        angle_deg = max(abs(action.angle_deg), 0.1)
+        yaw_speed = max(5.0, min(max_yaw_speed_deg_per_s, max_yaw_speed_deg_per_s))
+        return {
+            "vx": 0.0,
+            "vy": 0.0,
+            "vyaw": direction * yaw_speed,
+            "duration_sec": max(0.1, min(5.0, angle_deg / yaw_speed)),
+        }
+
+    return {"vx": 0.0, "vy": 0.0, "vyaw": 0.0, "duration_sec": 0.0}
+
+
+def _as_position(data: Any) -> dict[str, Any]:
+    if isinstance(data, dict):
+        return dict(data)
+    if isinstance(data, (list, tuple)):
+        keys = ("x", "y", "z")
+        return {keys[i]: data[i] for i in range(min(len(keys), len(data)))}
+    return {"x": 0.0, "y": 0.0, "z": 0.0}
+
+
+class Go2HttpRobot:
+    """Robot adapter for the standalone Go2 bridge service.
+
+    The bridge owns the official ``unitree_sdk2py`` imports and all DDS
+    initialisation. This package only speaks HTTP so it can run from the Agno
+    environment or any other host that can reach the robot bridge.
+    """
+
+    def __init__(
+        self,
+        endpoint: str = "http://127.0.0.1:8013",
+        timeout_s: float = 10.0,
+        dry_run: bool = True,
+        frame_dir: str | Path = "data/go2_frames",
+        frame_fetch: bool = True,
+        forward_speed_mps: float = 0.30,
+        max_linear_speed_mps: float = 0.50,
+        max_lateral_speed_mps: float = 0.30,
+        max_yaw_speed_deg_per_s: float = 80.0,
+        waypoint_duration_s: float = 0.50,
+    ) -> None:
+        self.endpoint = endpoint.rstrip("/")
+        self.timeout_s = timeout_s
+        self.dry_run = dry_run
+        self.frame_fetch = frame_fetch
+        self.frame_dir = Path(frame_dir)
+        self.frame_dir.mkdir(parents=True, exist_ok=True)
+        self.forward_speed_mps = forward_speed_mps
+        self.max_linear_speed_mps = max_linear_speed_mps
+        self.max_lateral_speed_mps = max_lateral_speed_mps
+        self.max_yaw_speed_deg_per_s = max_yaw_speed_deg_per_s
+        self.waypoint_duration_s = waypoint_duration_s
+
+        self.current_subgoal: SubGoal | None = None
+        self.step = 0
+        self.remaining_distance_m = 0.0
+        self.complete = False
+        self._frames: deque[str] = deque(maxlen=32)
+
+    def begin_subgoal(self, subgoal: SubGoal) -> None:
+        self.current_subgoal = subgoal
+        self.step = 0
+        self.complete = False
+        self.remaining_distance_m = subgoal.estimated_distance_m or 1.0
+        self._frames.clear()
+
+    def _get_json(self, path: str) -> dict[str, Any]:
+        import httpx
+
+        response = httpx.get(
+            f"{self.endpoint}{path}",
+            timeout=self.timeout_s,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        import httpx
+
+        response = httpx.post(
+            f"{self.endpoint}{path}",
+            json=payload,
+            timeout=self.timeout_s,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _fetch_frame(self) -> str:
+        if not self.frame_fetch:
+            return ""
+        try:
+            import httpx
+
+            response = httpx.get(
+                f"{self.endpoint}/frame",
+                timeout=self.timeout_s,
+            )
+            response.raise_for_status()
+            if not response.content:
+                return ""
+            name = (
+                f"{self.current_subgoal.id if self.current_subgoal else 'mission'}"
+                f"_step{self.step:04d}.jpg"
+            )
+            path = self.frame_dir / name
+            path.write_bytes(response.content)
+            self._frames.append(str(path.resolve()))
+            return str(path.resolve())
+        except Exception:
+            return ""
+
+    def observe(self) -> RobotState:
+        state_data: dict[str, Any] = {}
+        try:
+            data = self._get_json("/state")
+            if isinstance(data, dict):
+                state_data = data.get("state") or data
+        except Exception:
+            state_data = {}
+
+        frame_path = self._fetch_frame() or (self._frames[-1] if self._frames else "")
+        position = _as_position(state_data.get("position", {"x": self.step}))
+        try:
+            battery = float(state_data.get("battery", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            battery = 1.0
+        mode = str(state_data.get("mode") or ("navigating" if not self.complete else "idle"))
+        obstacle = bool(
+            state_data.get("obstacle")
+            or state_data.get("safety_stop")
+            or state_data.get("blocked")
+        )
+        return RobotState(
+            position=position,
+            battery=battery,
+            mode=mode,
+            frame_path=frame_path,
+            obstacle=obstacle,
+            remaining_distance_m=self.remaining_distance_m,
+        )
+
+    def _send_action(self, action: MidLevelAction) -> None:
+        command = action_to_go2_command(
+            action,
+            forward_speed_mps=self.forward_speed_mps,
+            max_linear_speed_mps=self.max_linear_speed_mps,
+            max_lateral_speed_mps=self.max_lateral_speed_mps,
+            max_yaw_speed_deg_per_s=self.max_yaw_speed_deg_per_s,
+            waypoint_duration_s=self.waypoint_duration_s,
+        )
+        command["dry_run"] = self.dry_run
+        if self.dry_run:
+            print(
+                f"[go2:dry-run] {action.describe()} -> "
+                f"vx={command['vx']:.2f} vy={command['vy']:.2f} "
+                f"vyaw={command['vyaw']:.2f} dur={command['duration_sec']:.2f}s"
+            )
+            return
+
+        if action.action_type == "stop":
+            self._post_json("/stop", {})
+            return
+        self._post_json("/move", command)
+
+    def execute(self, action: MidLevelAction) -> RobotState:
+        self._send_action(action)
+        if action.action_type in {"move_forward", "move"}:
+            self.remaining_distance_m = max(
+                0.0, self.remaining_distance_m - max(action.distance_m, 0.0)
+            )
+        self.step += 1
+        return self.observe()
+
+    def recent_frames(self, n: int) -> list[str]:
+        return list(self._frames)[-n:]
+
+    def is_complete(self, subgoal: SubGoal, state: RobotState) -> bool:
+        return self.complete or state.remaining_distance_m <= 0.05
+
+    def mark_complete(self) -> None:
+        self.complete = True
+        self.remaining_distance_m = 0.0
