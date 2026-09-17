@@ -13,6 +13,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-agno = ["agno>=2.9.0,<3.0"]
+agno = ["agno>=2.9.0,<3.0", "openai>=1.0", "sqlalchemy>=2.0"]
 lightnav = ["websockets>=12"]
 bridge = ["fastapi>=0.110", "uvicorn>=0.30"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["navila_agno*"]

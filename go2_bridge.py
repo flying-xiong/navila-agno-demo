@@ -23,6 +23,8 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="Unitree Go2 Bridge", version="0.1.0")
 
+OBSTACLE_STOP_DISTANCE_M = float(os.getenv("GO2_OBSTACLE_STOP_DISTANCE_M", "0.6"))
+
 
 class MoveRequest(BaseModel):
     vx: float = Field(default=0.0, ge=-1.0, le=1.0)
@@ -49,6 +51,7 @@ class Go2SDK:
             "mode": "unknown",
             "battery": None,
             "obstacle": False,
+            "range_obstacle": [0.0, 0.0, 0.0, 0.0],
         }
         self.sdk_available = False
 
@@ -103,6 +106,7 @@ class Go2SDK:
                 mode=_sport_mode_name(getattr(msg, "mode", None)),
                 battery=_battery_from_state(msg),
                 obstacle=_obstacle_from_state(msg),
+                range_obstacle=_to_list(getattr(msg, "range_obstacle", None), 4),
             )
 
         self._state_subscriber = ChannelSubscriber("rt/sportmodestate", SportModeState_)
@@ -222,9 +226,10 @@ def _obstacle_from_state(msg: Any) -> bool:
     if range_obstacle is None:
         return False
     try:
-        return bool(range_obstacle)
-    except Exception:  # noqa: BLE001
+        values = [float(x) for x in range_obstacle]
+    except (TypeError, ValueError):
         return False
+    return any(0.0 < value <= OBSTACLE_STOP_DISTANCE_M for value in values)
 
 
 _sdk = Go2SDK()

@@ -20,7 +20,9 @@ NAVILA_ROOT = Path(os.getenv("NAVILA_ROOT", str(Path(__file__).resolve().parent.
 sys.path.insert(0, str(NAVILA_ROOT))
 
 MODEL_PATH = os.getenv("NAVILA_MODEL_PATH", str(NAVILA_ROOT / "ckpt"))
-DEVICE = os.getenv("NAVILA_DEVICE", "cuda")
+CUDA_VISIBLE_DEVICES = os.getenv("NAVILA_CUDA_VISIBLE_DEVICES", "0")
+os.environ["CUDA_VISIBLE_DEVICES"] = CUDA_VISIBLE_DEVICES
+DEVICE = os.getenv("NAVILA_DEVICE", "cuda:0")
 
 
 class NavigateRequest(BaseModel):
@@ -50,7 +52,7 @@ def load_model() -> None:
 
     model_name = get_model_name_from_path(MODEL_PATH)
     tokenizer, model, image_processor, context_len = load_pretrained_model(
-        MODEL_PATH, model_name, None
+        MODEL_PATH, model_name, None, device=DEVICE
     )
     model.eval()
     _state.update(
