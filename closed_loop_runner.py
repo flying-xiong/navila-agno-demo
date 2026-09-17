@@ -266,7 +266,7 @@ def main() -> None:
     )
     parser.add_argument("--episode", default="86")
     parser.add_argument("--split", default="val_unseen")
-    parser.add_argument("--output", default=str(PROJECT_DIR / "output_closed_loop"))
+    parser.add_argument("--output", default=str(PROJECT_DIR / "runs" / "habitat"))
     parser.add_argument("--supervisor-url", default="http://127.0.0.1:8012")
     parser.add_argument("--navila-url", default="http://127.0.0.1:8011")
     parser.add_argument(

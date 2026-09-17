@@ -12,6 +12,7 @@ except ImportError:  # optional dependency; mock demo does not need it
         return None
 
 from navila_agno.contracts import ExecutionEvent
+from navila_agno.artifacts import RunArtifacts, compose_video
 from navila_agno.memory import EpisodeMemory
 from navila_agno.robot import Go2HttpRobot, MockRobot
 from navila_agno.runtime import MissionRuntime
@@ -113,12 +114,42 @@ def main() -> None:
         default="data/episode_memory.json",
         help="任务记忆落盘路径",
     )
+    parser.add_argument(
+        "--runs-dir",
+        default="runs",
+        help="运行产物根目录，每次运行会写入 runs/<kind>/<run_id>/",
+    )
+    parser.add_argument(
+        "--run-name",
+        default=None,
+        help="自定义运行目录后缀，默认使用 mission",
+    )
+    parser.add_argument(
+        "--record-video",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="运行结束后自动把 Go2 相机帧合成为 MP4",
+    )
+    parser.add_argument(
+        "--video-fps",
+        type=float,
+        default=4.0,
+        help="视频合成帧率，真实推理较慢时建议 3~5",
+    )
     args = parser.parse_args()
+
+    artifacts = RunArtifacts.create(
+        kind=args.robot,
+        mission=args.mission,
+        root=args.runs_dir,
+        run_name=args.run_name,
+    )
 
     if args.robot == "go2":
         robot = Go2HttpRobot(
             endpoint=args.go2_endpoint,
             dry_run=args.go2_dry_run,
+            frame_dir=artifacts.frames_dir,
         )
     else:
         robot = MockRobot(fail_subgoal_id=args.fail_subgoal)
@@ -148,6 +179,41 @@ def main() -> None:
     print(f"  完成子目标：{report.completed_subgoals}/{report.subgoals_total}")
     print(f"  事件数：{len(report.events)}")
     print(f"  记忆文件：{Path(args.memory).resolve()}")
+
+    recorded_frames = list(getattr(robot, "recorded_frames", []))
+    artifacts.frame_paths = recorded_frames
+    video_path = None
+    if args.record_video and recorded_frames:
+        video_path = compose_video(
+            recorded_frames,
+            artifacts.video_path,
+            fps=args.video_fps,
+        )
+
+    artifacts.write_metadata(
+        {
+            "supervisor": type(supervisor).__name__,
+            "vla": type(policy).__name__,
+            "robot": type(robot).__name__,
+            "success": report.success,
+            "subgoals_completed": report.completed_subgoals,
+            "subgoals_total": report.subgoals_total,
+            "events": [
+                {
+                    "type": event.type.value,
+                    "subgoal_id": event.subgoal_id,
+                    "message": event.message,
+                    "step_count": event.step_count,
+                }
+                for event in report.events
+            ],
+        }
+    )
+    print(f"  运行目录：{artifacts.run_dir.resolve()}")
+    if video_path is not None:
+        print(f"  视频：{video_path.resolve()}")
+    elif args.record_video:
+        print("  视频：未生成（没有可用的相机帧）")
 
 
 if __name__ == "__main__":

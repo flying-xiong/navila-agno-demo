@@ -40,6 +40,7 @@ navila-agno-demo/
 ├── ppt_demo.py                      # 生成 PPT 演示视频（NaVILA 回放 + Agno 规划叠加）
 ├── navila_agno/
 │   ├── contracts.py                 # SubGoal / Action / Event 契约
+│   ├── artifacts.py                 # 运行目录、帧管理、视频合成、run.json
 │   ├── robot.py                     # MockRobot + frame ring buffer
 │   ├── vla.py                       # MockVLA / NaVILAHttpClient / VLAExecutor
 │   ├── supervisor.py                # MockSupervisor / AgnoSupervisor
@@ -48,6 +49,7 @@ navila-agno-demo/
 │   ├── runtime.py                   # 将 supervisor 与 executor 连接
 │   └── skills/navigation/SKILL.md   # Agno 导航 Skill
 ├── tests/test_demo.py               # 离线闭环测试
+├── runs/                            # 每次运行的产物（不提交 Git）
 ├── requirements.txt
 ├── pyproject.toml
 └── .env.example
@@ -101,13 +103,13 @@ cd navila-agno-demo
 # 3. 启动 Habitat 闭环 runner（navila-eval 环境）
 CUDA_VISIBLE_DEVICES=1 ./scripts/run_closed_loop.sh \
   --episode 86 \
-  --output output_closed_loop \
+  --output runs/habitat/20260917-120000_demo \
   --max-outer-steps 120
 ```
 
 输出：
 
-- `output_closed_loop/episode=86-ckpt=0-spl=0.00.mp4`
+- `runs/habitat/<run_id>/episode=86-ckpt=0-spl=0.00.mp4`
 
 说明：
 
@@ -224,7 +226,12 @@ python demo.py "去 5 楼会议室 A" --supervisor mock --vla mock   --robot go2
 ENABLE_MOTION=1 ./scripts/run_go2_bridge.sh
 
 # 客户端端
-python demo.py "去 5 楼会议室 A" --supervisor agno --vla navila   --robot go2 --go2-endpoint http://127.0.0.1:8013 --no-go2-dry-run
+python demo.py "去 5 楼会议室 A" \
+  --supervisor agno \
+  --vla navila \
+  --robot go2 \
+  --go2-endpoint http://127.0.0.1:8013 \
+  --no-go2-dry-run
 ```
 
 Go2 bridge 提供的接口：
@@ -238,6 +245,46 @@ Go2 bridge 提供的接口：
 
 Go2 SDK 尚未安装时，bridge 仍可启动，`/state` 会返回 `available=false`，
 `demo.py --go2-dry-run` 可继续验证上层流程。
+
+## 运行产物与视频
+
+每次 `demo.py` 运行都会创建独立目录：
+
+```text
+runs/
+├── go2/
+│   └── 20260917-153000_去前方会议室/
+│       ├── frames/          # Go2 前视相机帧，按采集顺序命名
+│       ├── video.mp4        # 自动合成的 MP4
+│       └── run.json         # mission / supervisor / vla / 事件 / 视频路径
+└── mock/
+    └── ...
+```
+
+默认开启视频合成，可用参数调整：
+
+```bash
+# 关闭视频合成
+python demo.py "去前方会议室" --robot go2 --go2-dry-run --no-record-video
+
+# 调整合成帧率（真实推理较慢建议 3~5）
+python demo.py "去前方会议室" --robot go2 --go2-dry-run --video-fps 3
+
+# 自定义运行目录名后缀
+python demo.py "去前方会议室" --robot go2 --go2-dry-run --run-name demo1
+
+# 修改产物根目录
+python demo.py "去前方会议室" --robot go2 --go2-dry-run --runs-dir /data/navila_runs
+```
+
+旧版本的 `data/go2_frames/`、`output/output_closed_loop/` 和
+`output_closed_loop/` 已不再被新流程使用。可以一键归档：
+
+```bash
+./scripts/archive_legacy_outputs.sh
+```
+
+归档后会移动到 `archive/legacy_<timestamp>/`，不会直接删除。
 
 ## 上层契约示例
 

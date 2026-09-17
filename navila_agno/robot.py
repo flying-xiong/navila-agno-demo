@@ -194,6 +194,7 @@ class Go2HttpRobot:
         self.remaining_distance_m = 0.0
         self.complete = False
         self._frames: deque[str] = deque(maxlen=32)
+        self.recorded_frames: list[str] = []
 
     def begin_subgoal(self, subgoal: SubGoal) -> None:
         self.current_subgoal = subgoal
@@ -242,8 +243,11 @@ class Go2HttpRobot:
             )
             path = self.frame_dir / name
             path.write_bytes(response.content)
-            self._frames.append(str(path.resolve()))
-            return str(path.resolve())
+            resolved = str(path.resolve())
+            self._frames.append(resolved)
+            if not self.recorded_frames or self.recorded_frames[-1] != resolved:
+                self.recorded_frames.append(resolved)
+            return resolved
         except Exception:
             return ""
 
