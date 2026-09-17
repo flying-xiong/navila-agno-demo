@@ -125,6 +125,9 @@ class StepRecord:
     action_angle_deg: float = 0.0
     action_lateral_m: float = 0.0
     frame_path: str = ""
+    #: Frames the VLA saw this step, and how many of them reached the model.
+    history_frames: int = 0
+    video_frames: int = 0
     robot_state: dict[str, Any] = field(default_factory=dict)
     command: Optional[dict[str, Any]] = None
     command_response: Optional[dict[str, Any]] = None

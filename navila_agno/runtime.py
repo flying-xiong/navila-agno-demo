@@ -25,6 +25,7 @@ class MissionRuntime:
     def run(self, mission: str) -> MissionReport:
         plan: RoutePlan = self.supervisor.plan(mission)
         self.memory.start_mission(plan)
+        self.executor.begin_mission()
 
         queue: deque = deque(plan.subgoals)
         completed = 0

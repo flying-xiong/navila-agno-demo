@@ -17,6 +17,7 @@ import asyncio
 import base64
 import json
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -31,6 +32,7 @@ from .contracts import (
     StepRecord,
     SubGoal,
 )
+from .navila_memory import DEFAULT_NUM_VIDEO_FRAMES
 from .robot import RobotInterface, RobotTransportError
 
 
@@ -103,12 +105,26 @@ def build_navila_payload(
     image_paths: list[str],
     state: Optional[RobotState] = None,
 ) -> dict[str, Any]:
-    """Request body understood by the existing NaVILA bridge."""
+    """Request body understood by the NaVILA bridge.
+
+    ``image_paths`` is the whole recorded history; the bridge samples it down
+    to ``num_video_frames`` slots the way the official evaluation loop does.
+    """
     return {
         "instruction": instruction,
         "image_paths": image_paths,
-        "num_video_frames": len(image_paths),
+        "num_video_frames": navila_video_frames(),
     }
+
+
+def navila_video_frames() -> int:
+    """Clip length NaVILA consumes; the checkpoint ships with 8."""
+    raw = os.getenv("NAVILA_NUM_VIDEO_FRAMES")
+    try:
+        value = int(raw) if raw is not None else DEFAULT_NUM_VIDEO_FRAMES
+    except ValueError:
+        value = DEFAULT_NUM_VIDEO_FRAMES
+    return max(1, value)
 
 
 def parse_navila_response(data: dict[str, Any]) -> str:
@@ -283,6 +299,10 @@ class VLAExecutor:
     policy: VLAPolicy
     robot: RobotInterface
     frame_buffer_size: int = 8
+    #: Which frames the VLA sees: "episode" (whole mission, NaVILA's official
+    #: memory), "subgoal" (frames since this subgoal started) or "recent"
+    #: (sliding window of ``frame_buffer_size`` frames).
+    frame_memory: str = "episode"
     on_event: Optional[Callable[[ExecutionEvent], None]] = None
     on_step: Optional[Callable[[StepRecord], None]] = None
     on_subgoal: Optional[Callable[[SubGoal], None]] = None
@@ -298,6 +318,18 @@ class VLAExecutor:
         if self.on_step is not None:
             self.on_step(record)
 
+    def begin_mission(self) -> None:
+        begin = getattr(self.robot, "begin_mission", None)
+        if callable(begin):
+            begin()
+
+    def _observation_frames(self) -> list[str]:
+        if self.frame_memory == "recent":
+            return self.robot.recent_frames(self.frame_buffer_size)
+        if self.frame_memory == "subgoal":
+            return self.robot.subgoal_frames()
+        return self.robot.mission_frames()
+
     def _step_record(
         self,
         subgoal: SubGoal,
@@ -305,6 +337,7 @@ class VLAExecutor:
         state: RobotState,
         raw_action: str,
         action: MidLevelAction,
+        history_frames: int = 0,
     ) -> StepRecord:
         return StepRecord(
             subgoal_id=subgoal.id,
@@ -317,6 +350,8 @@ class VLAExecutor:
             action_angle_deg=action.angle_deg,
             action_lateral_m=action.lateral_m,
             frame_path=state.frame_path,
+            history_frames=history_frames,
+            video_frames=min(history_frames, navila_video_frames()),
             robot_state={
                 "position": state.position,
                 "mode": state.mode,
@@ -359,7 +394,7 @@ class VLAExecutor:
                 )
                 return ExecutionOutcome(event=event, action_trace=trace)
 
-            frames = self.robot.recent_frames(self.frame_buffer_size)
+            frames = self._observation_frames()
             raw_action = self.policy.predict(subgoal.instruction, frames, state)
             raw_text = (
                 raw_action
@@ -371,7 +406,9 @@ class VLAExecutor:
                 if isinstance(raw_action, MidLevelAction)
                 else parse_action(raw_action)
             )
-            record = self._step_record(subgoal, step, state, raw_text, action)
+            record = self._step_record(
+                subgoal, step, state, raw_text, action, history_frames=len(frames)
+            )
 
             trace.append(action)
             try:

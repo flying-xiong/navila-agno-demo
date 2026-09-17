@@ -24,6 +24,8 @@ class RobotCommandError(RobotTransportError):
 
 
 class RobotInterface(Protocol):
+    def begin_mission(self) -> None: ...
+
     def begin_subgoal(self, subgoal: SubGoal) -> None: ...
 
     def observe(self) -> RobotState: ...
@@ -31,6 +33,10 @@ class RobotInterface(Protocol):
     def execute(self, action: MidLevelAction) -> RobotState: ...
 
     def recent_frames(self, n: int) -> list[str]: ...
+
+    def mission_frames(self) -> list[str]: ...
+
+    def subgoal_frames(self) -> list[str]: ...
 
     def is_complete(self, subgoal: SubGoal, state: RobotState) -> bool: ...
 
@@ -52,6 +58,26 @@ class MockRobot:
         self.remaining_distance_m = 0.0
         self.complete = False
         self._frames: deque[str] = deque([f"mock://frame/{self.step}"], maxlen=32)
+        # Mission-scoped history: NaVILA's memory spans the whole trajectory,
+        # so it must survive subgoal boundaries.
+        self._history: list[str] = []
+        self._subgoal_start = 0
+
+    def begin_mission(self) -> None:
+        self._history.clear()
+        self._subgoal_start = 0
+        self._record_frame()
+
+    def _record_frame(self) -> None:
+        frame = f"mock://frame/{self.step}"
+        self._frames.append(frame)
+        self._history.append(frame)
+
+    def mission_frames(self) -> list[str]:
+        return list(self._history)
+
+    def subgoal_frames(self) -> list[str]:
+        return list(self._history[self._subgoal_start :])
 
     def begin_subgoal(self, subgoal: SubGoal) -> None:
         self.current_subgoal = subgoal
@@ -60,6 +86,7 @@ class MockRobot:
         self.remaining_distance_m = subgoal.estimated_distance_m or 1.0
         self._frames.clear()
         self._frames.append(f"mock://frame/{self.step}")
+        self._subgoal_start = max(0, len(self._history) - 1)
 
     def observe(self) -> RobotState:
         obstacle = (
@@ -83,7 +110,7 @@ class MockRobot:
                 0.0, self.remaining_distance_m - max(action.distance_m, 0.0)
             )
         self.step += 1
-        self._frames.append(f"mock://frame/{self.step}")
+        self._record_frame()
         return self.observe()
 
     def recent_frames(self, n: int) -> list[str]:
@@ -232,11 +259,27 @@ class Go2HttpRobot:
         self._start_position: dict[str, Any] | None = None
         self.complete = False
         self._frames: deque[str] = deque(maxlen=32)
+        # Mission-scoped history of every captured frame. NaVILA samples this
+        # down to a fixed clip, so it has to keep the whole trajectory rather
+        # than a sliding window.
+        self._history: list[str] = []
+        self._subgoal_start = 0
         self.recorded_frames: list[str] = []
         self.last_command: dict[str, Any] | None = None
         self.last_command_response: dict[str, Any] | None = None
 
+    def begin_mission(self) -> None:
+        self._history.clear()
+        self._subgoal_start = 0
+
+    def mission_frames(self) -> list[str]:
+        return list(self._history)
+
+    def subgoal_frames(self) -> list[str]:
+        return list(self._history[self._subgoal_start :])
+
     def begin_subgoal(self, subgoal: SubGoal) -> None:
+        self._subgoal_start = len(self._history)
         self.current_subgoal = subgoal
         self.step = 0
         self.complete = False
@@ -317,10 +360,16 @@ class Go2HttpRobot:
             path.write_bytes(response.content)
             resolved = str(path.resolve())
             self._frames.append(resolved)
+            if not self._history or self._history[-1] != resolved:
+                self._history.append(resolved)
             if not self.recorded_frames or self.recorded_frames[-1] != resolved:
                 self.recorded_frames.append(resolved)
             return resolved
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - a missing frame must not abort
+            # Staying silent here is dangerous: the VLA then sees an empty
+            # history and NaVILA answers "stop", which looks like the subgoal
+            # finished. Surface it instead.
+            print(f"[go2] 取帧失败（VLA 将以空历史推理）：{type(exc).__name__}: {exc}")
             return ""
 
     def observe(self) -> RobotState:

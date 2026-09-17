@@ -109,7 +109,22 @@ def main() -> None:
         "--frame-buffer-size",
         type=int,
         default=8,
-        help="NaVILA 最近观测帧窗口大小",
+        help="--frame-memory=recent 时的滑动窗口大小",
+    )
+    parser.add_argument(
+        "--frame-memory",
+        choices=["episode", "subgoal", "recent"],
+        default="episode",
+        help=(
+            "VLA 能看到的观测历史：episode=整段任务（NaVILA 官方记忆，"
+            "由 bridge 均匀采样成 8 帧）、subgoal=当前子目标内、recent=最近 N 帧"
+        ),
+    )
+    parser.add_argument(
+        "--num-video-frames",
+        type=int,
+        default=None,
+        help="NaVILA 每次推理的片段长度，默认 8（与 checkpoint 训练一致）",
     )
     parser.add_argument(
         "--memory",
@@ -164,6 +179,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.num_video_frames is not None:
+        os.environ["NAVILA_NUM_VIDEO_FRAMES"] = str(args.num_video_frames)
+
     step_records: list[dict[str, object]] = []
 
     def _on_step(record: StepRecord) -> None:
@@ -213,6 +231,7 @@ def main() -> None:
         policy=policy,
         robot=robot,
         frame_buffer_size=args.frame_buffer_size,
+        frame_memory=args.frame_memory,
         on_event=_on_event,
         on_step=_on_step,
         on_subgoal=_on_subgoal,

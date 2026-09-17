@@ -18,6 +18,13 @@ from pydantic import BaseModel, Field
 
 NAVILA_ROOT = Path(os.getenv("NAVILA_ROOT", str(Path(__file__).resolve().parent.parent / "NaVILA")))
 sys.path.insert(0, str(NAVILA_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from navila_agno.navila_memory import (  # noqa: E402
+    DEFAULT_NUM_VIDEO_FRAMES,
+    PADDING_FRAME_SIZE,
+    plan_frame_selection,
+)
 
 MODEL_PATH = os.getenv("NAVILA_MODEL_PATH", str(NAVILA_ROOT / "ckpt"))
 CUDA_VISIBLE_DEVICES = os.getenv("NAVILA_CUDA_VISIBLE_DEVICES", "0")
@@ -28,7 +35,9 @@ DEVICE = os.getenv("NAVILA_DEVICE", "cuda:0")
 class NavigateRequest(BaseModel):
     instruction: str
     image_paths: List[str] = Field(default_factory=list)
-    num_video_frames: int = 1
+    #: Target clip length. The bridge samples the history down to this many
+    #: slots, so ``image_paths`` may hold the whole trajectory.
+    num_video_frames: int = DEFAULT_NUM_VIDEO_FRAMES
     temperature: float = 0.0
     max_new_tokens: int = 64
 
@@ -36,6 +45,9 @@ class NavigateRequest(BaseModel):
 class NavigateResponse(BaseModel):
     action: str
     model_path: str = MODEL_PATH
+    num_video_frames: int = DEFAULT_NUM_VIDEO_FRAMES
+    history_frames: int = 0
+    sampled_frame_paths: List[str] = Field(default_factory=list)
 
 
 app = FastAPI(title="NaVILA Bridge", version="0.1.0")
@@ -88,14 +100,34 @@ def _build_inputs(req: NavigateRequest) -> dict:
     from llava.conversation import SeparatorStyle
     from llava.mm_utils import KeywordsStoppingCriteria, process_images, tokenizer_image_token
 
-    images = [Image.open(p).convert("RGB") for p in req.image_paths]
-    if not images:
+    if not req.image_paths:
         raise HTTPException(status_code=400, detail="image_paths 不能为空")
-    if req.num_video_frames != len(images):
+
+    num_frames = int(req.num_video_frames or DEFAULT_NUM_VIDEO_FRAMES)
+    selection = plan_frame_selection(len(req.image_paths), num_frames)
+    missing = [
+        req.image_paths[index]
+        for index in selection
+        if index is not None and not Path(req.image_paths[index]).is_file()
+    ]
+    if missing:
         raise HTTPException(
             status_code=400,
-            detail=f"num_video_frames({req.num_video_frames}) 必须等于 image_paths 数量({len(images)})",
+            detail=f"抽中的历史帧不存在：{missing[:3]}",
         )
+
+    images = []
+    for index in selection:
+        if index is None:
+            images.append(
+                Image.new(
+                    "RGB",
+                    (PADDING_FRAME_SIZE, PADDING_FRAME_SIZE),
+                    color=(0, 0, 0),
+                )
+            )
+        else:
+            images.append(Image.open(req.image_paths[index]).convert("RGB"))
 
     image_token = "<image>\n"
     question = (
@@ -137,6 +169,7 @@ def _build_inputs(req: NavigateRequest) -> dict:
         "stopping_criteria": [stopping_criteria],
         "tokenizer": tokenizer,
         "stop_str": stop_str,
+        "selection": selection,
     }
 
 
@@ -164,7 +197,15 @@ def navigate(req: NavigateRequest) -> NavigateResponse:
     outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
     if outputs.endswith(inputs["stop_str"]):
         outputs = outputs[: -len(inputs["stop_str"])].strip()
-    return NavigateResponse(action=outputs)
+    selection = inputs["selection"]
+    return NavigateResponse(
+        action=outputs,
+        num_video_frames=len(selection),
+        history_frames=len(req.image_paths),
+        sampled_frame_paths=[
+            req.image_paths[index] for index in selection if index is not None
+        ],
+    )
 
 
 if __name__ == "__main__":

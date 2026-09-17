@@ -17,7 +17,7 @@
                                     ▼
 ┌──────────────────────────────────────────────────────────┐
 │ VLAExecutor（闭环运行）                                    │
-│   frame ring buffer → NaVILA policy → action → robot      │
+│   历史帧缓冲 → NaVILA policy → action → robot              │
 └───────────────┬──────────────────────────────┬───────────┘
                 │ 帧 / 状态                      │ Event
                 ▼                                ▼
@@ -30,6 +30,8 @@
 
 - Agno 不进入高频控制循环，只在任务开始、子目标完成或异常事件时介入。
 - NaVILA 通过 HTTP bridge 独立运行，不与 Agno 共用 Python 环境。
+- 帧记忆分两层：robot 按任务累积整段历史帧，bridge 每次推理把它采样成
+  NaVILA 需要的 8 帧片段（见「接入真实 NaVILA」）。
 - 中层动作从 NaVILA 的自由文本解析为结构化动作，再交给机器人底层。
 
 ## 目录
@@ -181,10 +183,34 @@ python demo.py "去 5 楼会议室 A" --supervisor agno --vla http
 ```json
 {
   "instruction": "走到电梯 C 门口并停下",
-  "image_paths": ["hist_0.jpg", "hist_1.jpg", "current.jpg"],
-  "num_video_frames": 3
+  "image_paths": ["hist_0.jpg", "hist_1.jpg", "...", "current.jpg"],
+  "num_video_frames": 8
 }
 ```
+
+`image_paths` 是**整段任务的历史帧**，`num_video_frames` 是目标片段长度
+（`NAVILA_NUM_VIDEO_FRAMES`，默认 8，与 checkpoint 训练时一致）。bridge 负责
+按官方 `sample_and_pad_images` 的语义把历史采样成 8 帧：
+
+- 历史不足 8 帧：前面补黑帧，真实帧一帧不丢；
+- 历史超过 8 帧：`linspace(0, N-1, num=7, endpoint=False)` 在**整段轨迹**上均匀
+  取 7 帧，再拼上最新帧。
+
+采样结果会随 `NavigateResponse.sampled_frame_paths` 返回，`steps.jsonl` 里每步也
+记了 `history_frames` / `video_frames`，方便核对模型到底看到了哪几帧。
+
+### 观测记忆模式
+
+`--frame-memory` 决定 VLA 能看到多少历史（默认 `episode`，即 NaVILA 官方行为）：
+
+| 模式 | 送入 VLA 的帧 | 说明 |
+| --- | --- | --- |
+| `episode` | 整段任务的帧 | 默认。跨度覆盖整条轨迹，走廊起点/经过的门不会被丢掉 |
+| `subgoal` | 当前子目标开始后的帧 | 折中，避免上一个子目标的画面干扰新指令 |
+| `recent` | 最近 `--frame-buffer-size` 帧 | 旧行为，滑动窗口，只保留最近 8 步 |
+
+`--vla lightnav` 时建议用 `recent`：LightNav 的 WebSocket 协议要把历史序列逐帧重放，
+`episode` 会让每步重放开销随任务长度线性增长。
 
 ## 接入 LightNav-0
 
@@ -398,6 +424,8 @@ need_help
 
 ## 下一步
 
+- NaVILA 记忆已对齐官方（全历史 + 8 帧均匀采样）；下一步接你 NaVILA 分支里的
+  子模记忆采样器 `llava/vlnce_memory_sampler.py`，与均匀采样做 A/B 对比。
 - 将 `Go2HttpRobot` 的相机帧接入 Go2 bridge `/frame` 的连续流/ROS2 vision bridge。
 - 用真实室内语义图或地图 API 扩展 `map_route`，替代当前确定性 waypoint。
 - 用 LightNav-0 的 `robot_deploy/` MPC 控制器验证 waypoint 到 Go2 步态的执行层。

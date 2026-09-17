@@ -28,7 +28,10 @@ PROJECT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_DIR))
 
 from navila_agno.contracts import EventType, SubGoal  # noqa: E402
+from navila_agno.navila_memory import DEFAULT_NUM_VIDEO_FRAMES  # noqa: E402
 from navila_agno.vla import parse_action  # noqa: E402
+
+NAVILA_VIDEO_FRAMES = DEFAULT_NUM_VIDEO_FRAMES
 
 
 def _http_json(url: str, payload: dict[str, Any], timeout: float = 360.0) -> dict[str, Any]:
@@ -165,11 +168,14 @@ def run_closed_loop(
         if queue_actions:
             action_idx = queue_actions.popleft()
         else:
-            frames = past_paths[-8:] + [current_path]
+            # Match the official NaVILA loop: hand over the whole episode
+            # history and let the bridge sample it down to a fixed clip, so
+            # landmarks from the start of the trajectory stay in context.
+            frames = past_paths + [current_path]
             payload = {
                 "instruction": current_subgoal.instruction,
                 "image_paths": frames,
-                "num_video_frames": len(frames),
+                "num_video_frames": NAVILA_VIDEO_FRAMES,
             }
             response = _http_json(f"{navila_url}/v1/navigate", payload)
             last_action_text = response.get("action", "stop")
