@@ -45,9 +45,7 @@ class MockRobot:
         self.fail_after_steps = fail_after_steps
         self.current_subgoal: SubGoal | None = None
         self.step = 0
-        self._estimated_distance_m = 0.0
         self.remaining_distance_m = 0.0
-        self._start_position: dict[str, Any] | None = None
         self.complete = False
         self._frames: deque[str] = deque([f"mock://frame/{self.step}"], maxlen=32)
 
@@ -55,20 +53,7 @@ class MockRobot:
         self.current_subgoal = subgoal
         self.step = 0
         self.complete = False
-        self._estimated_distance_m = (
-            float(subgoal.estimated_distance_m)
-            if subgoal.estimated_distance_m is not None
-            else 1.0
-        )
-        self.remaining_distance_m = self._estimated_distance_m
-        self._start_position = None
-        try:
-            data = self._get_json("/state")
-            state = data.get("state") if isinstance(data, dict) else None
-            if isinstance(state, dict):
-                self._start_position = _as_position(state.get("position"))
-        except Exception:  # noqa: BLE001 - fall back to action-distance estimate
-            self._start_position = None
+        self.remaining_distance_m = subgoal.estimated_distance_m or 1.0
         self._frames.clear()
         self._frames.append(f"mock://frame/{self.step}")
 
@@ -231,6 +216,8 @@ class Go2HttpRobot:
         self.current_subgoal: SubGoal | None = None
         self.step = 0
         self.remaining_distance_m = 0.0
+        self._estimated_distance_m = 0.0
+        self._start_position: dict[str, Any] | None = None
         self.complete = False
         self._frames: deque[str] = deque(maxlen=32)
         self.recorded_frames: list[str] = []
@@ -241,7 +228,20 @@ class Go2HttpRobot:
         self.current_subgoal = subgoal
         self.step = 0
         self.complete = False
-        self.remaining_distance_m = subgoal.estimated_distance_m or 1.0
+        self._estimated_distance_m = (
+            float(subgoal.estimated_distance_m)
+            if subgoal.estimated_distance_m is not None
+            else 1.0
+        )
+        self.remaining_distance_m = self._estimated_distance_m
+        self._start_position = None
+        try:
+            data = self._get_json("/state")
+            state = data.get("state") if isinstance(data, dict) else None
+            if isinstance(state, dict):
+                self._start_position = _as_position(state.get("position"))
+        except Exception:  # noqa: BLE001 - fall back to action-distance estimate
+            self._start_position = None
         self._frames.clear()
 
     def _request(
