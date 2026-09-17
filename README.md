@@ -288,12 +288,49 @@ runs/
 ├── go2/
 │   └── 20260917-153000_去前方会议室/
 │       ├── frames/          # Go2 前视相机帧，按采集顺序命名
-│       ├── video.mp4        # 自动合成的 MP4
+│       ├── annotated/       # 已烧入字幕的帧，可直接插到 PPT 当截图
+│       ├── video.mp4        # 自动合成的 MP4（带字幕，节奏放慢）
 │       ├── steps.jsonl      # 逐步调试记录，每行一个 JSON
 │       └── run.json         # mission / subgoals / steps / events / 视频路径
 └── mock/
     └── ...
 ```
+
+### 带字幕的 PPT 视频
+
+默认会把 `任务 / 子目标 / 当前动作` 烧进每一帧，方便对着视频讲“现在走到哪一步”：
+
+- 顶部：任务原文（左）+ 机器人状态（右，例如 `mode=walk`）
+- 底部：`子目标 sg-1 (1/3)`、`step 2/4`、子目标原文、NaVILA 输出的原句、
+  映射出的动作、下发的 Go2 指令、剩余距离与当前位姿
+- 最底边：细进度条表示该子目标内的步数进度
+- 片头是任务卡，片尾是结果卡（成功与否、子目标清单）
+
+节奏靠每步停留时长控制，默认 `--video-hold-s 1.2`（停下动作自动延长 1.6 倍），
+这样每一步都能停下来讲；配合 `--video-intro-s` / `--video-outro-s` 调片头片尾。
+
+```bash
+# 更慢、更适合逐帧讲解
+python demo.py "去前方会议室" \
+  --supervisor agno --vla navila --robot go2 \
+  --go2-endpoint http://10.81.6.68:8013 --no-go2-dry-run \
+  --video-hold-s 2.0
+
+# 不要字幕，回到原始固定帧率
+python demo.py "去前方会议室" --robot go2 --go2-dry-run --no-video-overlay --video-fps 4
+```
+
+已跑完的任务可以离线重渲染，不用再连机器人：
+
+```bash
+python scripts/render_run_video.py runs/go2/20260917-153000_去前方会议室 --hold-s 2.0
+# 输出 runs/go2/<run_id>/video_annotated.mp4 与 annotated/ 下的静帧
+```
+
+字幕用 Pillow 直接画进像素，不走 ffmpeg `drawtext`。原因是这台机器上常见的
+CJK 兜底字体（Droid Sans Fallback）不含任何拉丁字母和数字字形，直接用会把
+所有英文和数字渲染成方框；`navila_agno/overlay.py` 因此按字符在“拉丁字体”和
+“CJK 字体”之间切换，保证中英文都正常。
 
 默认开启视频合成，可用参数调整：
 

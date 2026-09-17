@@ -13,6 +13,7 @@ except ImportError:  # optional dependency; mock demo does not need it
         return None
 
 from navila_agno.artifacts import RunArtifacts, compose_video
+from navila_agno.video import build_timeline, render_video
 from navila_agno.contracts import ExecutionEvent, StepRecord
 from navila_agno.memory import EpisodeMemory
 from navila_agno.robot import Go2HttpRobot, MockRobot
@@ -135,7 +136,31 @@ def main() -> None:
         "--video-fps",
         type=float,
         default=4.0,
-        help="视频合成帧率，真实推理较慢时建议 3~5",
+        help="关闭字幕时的视频帧率，真实推理较慢时建议 3~5",
+    )
+    parser.add_argument(
+        "--video-overlay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="把任务/子目标/当前动作烧进每一帧（PPT 展示用）",
+    )
+    parser.add_argument(
+        "--video-hold-s",
+        type=float,
+        default=1.2,
+        help="每一步画面停留的秒数，越大越慢，方便暂停讲解",
+    )
+    parser.add_argument(
+        "--video-intro-s",
+        type=float,
+        default=3.0,
+        help="片头任务卡停留秒数",
+    )
+    parser.add_argument(
+        "--video-outro-s",
+        type=float,
+        default=4.0,
+        help="片尾结果卡停留秒数",
     )
     args = parser.parse_args()
 
@@ -148,7 +173,15 @@ def main() -> None:
             f"vla={record.raw_vla[:60]!r} -> {record.action_type}"
         )
 
+    subgoal_meta: dict[str, dict[str, object]] = {}
+
     def _on_subgoal(subgoal: object) -> None:
+        subgoal_meta[subgoal.id] = {
+            "index": len(subgoal_meta) + 1,
+            "instruction": subgoal.instruction,
+            "max_steps": subgoal.max_steps,
+            "estimated_distance_m": subgoal.estimated_distance_m,
+        }
         print(
             f"  [subgoal] {subgoal.id}: {subgoal.instruction} "
             f"(max_steps={subgoal.max_steps}, est={subgoal.estimated_distance_m})"
@@ -203,11 +236,54 @@ def main() -> None:
     artifacts.write_steps(step_records)
     video_path = None
     if args.record_video and recorded_frames:
-        video_path = compose_video(
-            recorded_frames,
-            artifacts.video_path,
-            fps=args.video_fps,
-        )
+        total_subgoals = len(subgoal_meta)
+        for meta in subgoal_meta.values():
+            meta["total"] = total_subgoals
+        if args.video_overlay:
+            timeline = build_timeline(
+                recorded_frames,
+                step_records,
+                subgoal_meta,
+                args.mission,
+                hold_s=args.video_hold_s,
+            )
+            video_path = render_video(
+                timeline,
+                artifacts.video_path,
+                artifacts.run_dir / "annotated",
+                intro=(
+                    args.mission,
+                    f"NaVILA × Agno  |  {total_subgoals} 个子目标  |  {len(step_records)} 步",
+                    [
+                        f"supervisor={type(supervisor).__name__}"
+                        f"   vla={type(policy).__name__}"
+                        f"   robot={type(robot).__name__}",
+                        "Agno 负责高层任务分解，NaVILA 负责逐步视觉语言导航；"
+                        "每步画面下方为当前子目标与 VLA 输出。",
+                    ],
+                ),
+                intro_s=args.video_intro_s,
+                outro=(
+                    "任务结束" if report.success else "任务未完成",
+                    args.mission,
+                    [
+                        f"成功：{'是' if report.success else '否'}"
+                        f"   完成子目标：{report.completed_subgoals}/{report.subgoals_total}",
+                        f"总步数：{len(step_records)}   事件数：{len(report.events)}",
+                    ]
+                    + [
+                        f"子目标 {sid}：{meta['instruction']}"
+                        for sid, meta in subgoal_meta.items()
+                    ],
+                ),
+                outro_s=args.video_outro_s,
+            )
+        else:
+            video_path = compose_video(
+                recorded_frames,
+                artifacts.video_path,
+                fps=args.video_fps,
+            )
 
     artifacts.write_metadata(
         {
@@ -224,6 +300,15 @@ def main() -> None:
             ),
             "steps": step_records,
             "steps_file": str(artifacts.steps_path),
+            "frame_order": recorded_frames,
+            "video_overlay": bool(args.video_overlay),
+            "video_hold_s": args.video_hold_s,
+            "annotated_frames": (
+                str((artifacts.run_dir / "annotated").resolve())
+                if args.video_overlay
+                else None
+            ),
+            "subgoal_meta": subgoal_meta,
             "events": [
                 {
                     "type": event.type.value,
