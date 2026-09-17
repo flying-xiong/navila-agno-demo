@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from dataclasses import asdict
 from pathlib import Path
 
 try:
@@ -11,8 +12,8 @@ except ImportError:  # optional dependency; mock demo does not need it
     def load_dotenv(*_args: object, **_kwargs: object) -> None:
         return None
 
-from navila_agno.contracts import ExecutionEvent
 from navila_agno.artifacts import RunArtifacts, compose_video
+from navila_agno.contracts import ExecutionEvent, StepRecord
 from navila_agno.memory import EpisodeMemory
 from navila_agno.robot import Go2HttpRobot, MockRobot
 from navila_agno.runtime import MissionRuntime
@@ -138,6 +139,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    step_records: list[dict[str, object]] = []
+
+    def _on_step(record: StepRecord) -> None:
+        step_records.append(asdict(record))
+        print(
+            f"  [step] {record.subgoal_id} step={record.step} "
+            f"vla={record.raw_vla[:60]!r} -> {record.action_type}"
+        )
+
     artifacts = RunArtifacts.create(
         kind=args.robot,
         mission=args.mission,
@@ -165,6 +175,7 @@ def main() -> None:
         robot=robot,
         frame_buffer_size=args.frame_buffer_size,
         on_event=_on_event,
+        on_step=_on_step,
     )
     supervisor = _make_supervisor(args.supervisor)
     runtime = MissionRuntime(supervisor=supervisor, executor=executor, memory=memory)
@@ -182,6 +193,7 @@ def main() -> None:
 
     recorded_frames = list(getattr(robot, "recorded_frames", []))
     artifacts.frame_paths = recorded_frames
+    artifacts.write_steps(step_records)
     video_path = None
     if args.record_video and recorded_frames:
         video_path = compose_video(
@@ -198,6 +210,13 @@ def main() -> None:
             "success": report.success,
             "subgoals_completed": report.completed_subgoals,
             "subgoals_total": report.subgoals_total,
+            "subgoals": (
+                [asdict(subgoal) for subgoal in report.route_plan.subgoals]
+                if report.route_plan is not None
+                else []
+            ),
+            "steps": step_records,
+            "steps_file": str(artifacts.steps_path),
             "events": [
                 {
                     "type": event.type.value,

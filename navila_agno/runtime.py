@@ -58,4 +58,5 @@ class MissionRuntime:
             completed_subgoals=completed,
             events=events,
             success=not aborted,
+            route_plan=plan,
         )

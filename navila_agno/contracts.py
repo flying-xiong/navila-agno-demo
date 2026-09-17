@@ -108,6 +108,26 @@ class MissionReport:
     completed_subgoals: int
     events: list[ExecutionEvent] = field(default_factory=list)
     success: bool = False
+    route_plan: Optional["RoutePlan"] = None
+
+
+@dataclass
+class StepRecord:
+    """Per-step debug record for one supervisor/VLA execution cycle."""
+
+    subgoal_id: str
+    instruction: str
+    step: int
+    timestamp: str
+    raw_vla: str = ""
+    action_type: str = ""
+    action_distance_m: float = 0.0
+    action_angle_deg: float = 0.0
+    action_lateral_m: float = 0.0
+    frame_path: str = ""
+    robot_state: dict[str, Any] = field(default_factory=dict)
+    command: Optional[dict[str, Any]] = None
+    command_response: Optional[dict[str, Any]] = None
 
 
 @dataclass

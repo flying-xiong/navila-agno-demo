@@ -159,7 +159,11 @@ class AgnoSupervisor(Supervisor):
             tools=[map_route, robot_status, ask_human],
             instructions=[
                 "你是 NaVILA 导航系统的高层监督者。",
-                "把任务分解为短、具体、可验证的子目标，供 NaVILA 执行。",
+                "把任务分解为短、具体、可由 NaVILA 直接执行的物理移动子目标。",
+                "禁止生成 verify/check/report/ask/confirm 等非移动子目标。",
+                "不要生成单独的“到达验证”步骤；最后一个子目标用 walk to ... and stop 表达到达。",
+                "如果只需要转向，instruction 写成 turn left/right ... and then continue。",
+                "estimated_distance_m 表示该子目标预期前进的米数；纯转向子目标设为 0.5~1.0，不要设为 0。",
                 "子目标不要包含长期历史，只保留当前段所需的上下文和约束。",
                 "当地图、机器人状态或异常事件可用时，优先调用对应工具。",
                 "遇到失败或阻塞时给出替换子目标；无法决策时调用 ask_human。",
@@ -173,8 +177,11 @@ class AgnoSupervisor(Supervisor):
 
         prompt = (
             "你是导航监督者。请把任务分解成 NaVILA 可执行的子目标，只返回 JSON 数组。"
+            "每个子目标必须是物理移动段，禁止 verify/check/report/ask/confirm 类步骤。"
+            "最后一个子目标直接用 walk to ... and stop 表达到达，不要额外生成验证步骤。"
             "每个元素包含 id, instruction（英文，直接给 NaVILA）、note_zh（中文一句说明，用于 PPT 字幕）、"
-            "context, constraints, completion_criteria, estimated_distance_m, max_steps。\n任务："
+            "context, constraints, completion_criteria, estimated_distance_m（预期前进米数，纯转向设 0.5~1.0）, "
+            "max_steps（不超过 30）。\n任务："
             + mission
         )
         try:
@@ -192,7 +199,8 @@ class AgnoSupervisor(Supervisor):
 
         prompt = (
             "导航执行发生异常。请给出替代子目标 JSON 数组；如果无法自主决策，"
-            f"返回空数组。\n事件：{event.type.value} {event.message}\n原任务：{mission}"
+            "替代子目标同样必须是物理移动段，禁止 verify/check/report/ask/confirm 类步骤。"
+            f"如果无法给出移动子目标，返回空数组。\n事件：{event.type.value} {event.message}\n原任务：{mission}"
         )
         try:
             raw = self.agent.run(prompt).content
@@ -217,6 +225,11 @@ class AgnoSupervisor(Supervisor):
         for item in data:
             if not isinstance(item, dict) or "instruction" not in item:
                 continue
+            try:
+                max_steps = int(item.get("max_steps", 12))
+            except (TypeError, ValueError):
+                max_steps = 12
+            max_steps = max(1, min(max_steps, 30))
             constraints_raw = item.get("constraints", [])
             if isinstance(constraints_raw, str):
                 constraints = [constraints_raw]
@@ -230,7 +243,7 @@ class AgnoSupervisor(Supervisor):
                     constraints=constraints,
                     completion_criteria=str(item.get("completion_criteria", "")),
                     estimated_distance_m=item.get("estimated_distance_m"),
-                    max_steps=int(item.get("max_steps", 12)),
+                    max_steps=max_steps,
                     note_zh=str(item.get("note_zh", "")),
                 )
             )

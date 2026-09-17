@@ -45,7 +45,9 @@ class MockRobot:
         self.fail_after_steps = fail_after_steps
         self.current_subgoal: SubGoal | None = None
         self.step = 0
+        self._estimated_distance_m = 0.0
         self.remaining_distance_m = 0.0
+        self._start_position: dict[str, Any] | None = None
         self.complete = False
         self._frames: deque[str] = deque([f"mock://frame/{self.step}"], maxlen=32)
 
@@ -53,7 +55,20 @@ class MockRobot:
         self.current_subgoal = subgoal
         self.step = 0
         self.complete = False
-        self.remaining_distance_m = subgoal.estimated_distance_m or 1.0
+        self._estimated_distance_m = (
+            float(subgoal.estimated_distance_m)
+            if subgoal.estimated_distance_m is not None
+            else 1.0
+        )
+        self.remaining_distance_m = self._estimated_distance_m
+        self._start_position = None
+        try:
+            data = self._get_json("/state")
+            state = data.get("state") if isinstance(data, dict) else None
+            if isinstance(state, dict):
+                self._start_position = _as_position(state.get("position"))
+        except Exception:  # noqa: BLE001 - fall back to action-distance estimate
+            self._start_position = None
         self._frames.clear()
         self._frames.append(f"mock://frame/{self.step}")
 
@@ -165,6 +180,15 @@ def _as_position(data: Any) -> dict[str, Any]:
     return {"x": 0.0, "y": 0.0, "z": 0.0}
 
 
+def _distance_between(first: dict[str, Any], second: dict[str, Any]) -> float:
+    try:
+        dx = float(second.get("x", 0.0)) - float(first.get("x", 0.0))
+        dy = float(second.get("y", 0.0)) - float(first.get("y", 0.0))
+        return math.hypot(dx, dy)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class Go2HttpRobot:
     """Robot adapter for the standalone Go2 bridge service.
 
@@ -210,6 +234,8 @@ class Go2HttpRobot:
         self.complete = False
         self._frames: deque[str] = deque(maxlen=32)
         self.recorded_frames: list[str] = []
+        self.last_command: dict[str, Any] | None = None
+        self.last_command_response: dict[str, Any] | None = None
 
     def begin_subgoal(self, subgoal: SubGoal) -> None:
         self.current_subgoal = subgoal
@@ -291,6 +317,12 @@ class Go2HttpRobot:
 
         frame_path = self._fetch_frame() or (self._frames[-1] if self._frames else "")
         position = _as_position(state_data.get("position", {"x": self.step}))
+        if self._start_position is not None and not self.dry_run:
+            traveled = _distance_between(self._start_position, position)
+            self.remaining_distance_m = max(
+                0.0,
+                self._estimated_distance_m - traveled,
+            )
         try:
             battery = float(state_data.get("battery", 1.0) or 1.0)
         except (TypeError, ValueError):
@@ -320,19 +352,23 @@ class Go2HttpRobot:
             waypoint_duration_s=self.waypoint_duration_s,
         )
         command["dry_run"] = self.dry_run
+        self.last_command = dict(command)
+        self.last_command_response = None
         if self.dry_run:
             print(
                 f"[go2:dry-run] {action.describe()} -> "
                 f"vx={command['vx']:.2f} vy={command['vy']:.2f} "
                 f"vyaw={command['vyaw']:.2f} dur={command['duration_sec']:.2f}s"
             )
+            self.last_command_response = {"rc": 0, "msg": "dry-run"}
             return
 
         if action.action_type == "stop":
-            self._post_json("/stop", {})
+            self.last_command_response = self._post_json("/stop", {})
             return
         try:
             response = self._post_json("/move", command)
+            self.last_command_response = dict(response)
             rc = int(response.get("rc", 0) or 0)
             if rc != 0:
                 raise RobotCommandError(f"Go2 Move 返回错误码 rc={rc}")
@@ -342,13 +378,16 @@ class Go2HttpRobot:
 
     def _stop_safely(self) -> None:
         try:
-            self._post_json("/stop", {})
+            self.last_command_response = self._post_json("/stop", {})
         except Exception:  # noqa: BLE001 - best effort safety stop
             return
 
     def execute(self, action: MidLevelAction) -> RobotState:
         self._send_action(action)
-        if action.action_type in {"move_forward", "move"}:
+        if (
+            self.dry_run
+            or self._start_position is None
+        ) and action.action_type in {"move_forward", "move"}:
             self.remaining_distance_m = max(
                 0.0, self.remaining_distance_m - max(action.distance_m, 0.0)
             )

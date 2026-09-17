@@ -30,6 +30,7 @@ class RunArtifacts:
     frames_dir: Path
     video_path: Path
     metadata_path: Path
+    steps_path: Path
     started_at: str
     frame_paths: list[str] = field(default_factory=list)
 
@@ -58,6 +59,7 @@ class RunArtifacts:
             frames_dir=frames_dir,
             video_path=run_dir / "video.mp4",
             metadata_path=run_dir / "run.json",
+            steps_path=run_dir / "steps.jsonl",
             started_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         )
 
@@ -80,6 +82,12 @@ class RunArtifacts:
             encoding="utf-8",
         )
         return self.metadata_path
+
+    def write_steps(self, steps: Iterable[dict[str, Any]]) -> Path:
+        with self.steps_path.open("w", encoding="utf-8") as handle:
+            for step in steps:
+                handle.write(json.dumps(step, ensure_ascii=False) + "\n")
+        return self.steps_path
 
 
 def compose_video(

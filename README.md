@@ -280,7 +280,8 @@ runs/
 │   └── 20260917-153000_去前方会议室/
 │       ├── frames/          # Go2 前视相机帧，按采集顺序命名
 │       ├── video.mp4        # 自动合成的 MP4
-│       └── run.json         # mission / supervisor / vla / 事件 / 视频路径
+│       ├── steps.jsonl      # 逐步调试记录，每行一个 JSON
+│       └── run.json         # mission / subgoals / steps / events / 视频路径
 └── mock/
     └── ...
 ```
@@ -300,6 +301,18 @@ python demo.py "去前方会议室" --robot go2 --go2-dry-run --run-name demo1
 # 修改产物根目录
 python demo.py "去前方会议室" --robot go2 --go2-dry-run --runs-dir /data/navila_runs
 ```
+
+`run.json` 和 `steps.jsonl` 会记录：
+
+- Agno 规划出的完整 `subgoals`
+- 每一步的 `raw_vla`：NaVILA 原始文本输出
+- 解析后的 `action`：`move_forward` / `turn_left` / `turn_right` / `move` / `stop`
+- 发送给 Go2 的 `command`：`vx` / `vy` / `vyaw` / `duration_sec` / `dry_run`
+- Go2 bridge 返回的 `command_response`：`rc` / `stop_rc`
+- 每一步的机器人状态、帧路径、事件和步数
+
+如果 NaVILA 在第一步就返回 `stop`，但 `remaining_distance_m` 仍大于
+`0.5m`，会触发 `uncertain` 事件并请求 Agno 重新规划，而不是直接进入下一个子目标。
 
 旧版本的 `data/go2_frames/`、`output/output_closed_loop/` 和
 `output_closed_loop/` 已不再被新流程使用。可以一键归档：

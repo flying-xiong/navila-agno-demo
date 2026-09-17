@@ -19,6 +19,7 @@ import json
 import math
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Callable, Optional, Protocol
 
 from .contracts import (
@@ -27,6 +28,7 @@ from .contracts import (
     ExecutionOutcome,
     MidLevelAction,
     RobotState,
+    StepRecord,
     SubGoal,
 )
 from .robot import RobotInterface, RobotTransportError
@@ -282,6 +284,7 @@ class VLAExecutor:
     robot: RobotInterface
     frame_buffer_size: int = 8
     on_event: Optional[Callable[[ExecutionEvent], None]] = None
+    on_step: Optional[Callable[[StepRecord], None]] = None
     _last_event: Optional[ExecutionEvent] = field(default=None, repr=False)
 
     def _emit(self, event: ExecutionEvent) -> ExecutionEvent:
@@ -289,6 +292,38 @@ class VLAExecutor:
         if self.on_event is not None:
             self.on_event(event)
         return event
+
+    def _emit_step(self, record: StepRecord) -> None:
+        if self.on_step is not None:
+            self.on_step(record)
+
+    def _step_record(
+        self,
+        subgoal: SubGoal,
+        step: int,
+        state: RobotState,
+        raw_action: str,
+        action: MidLevelAction,
+    ) -> StepRecord:
+        return StepRecord(
+            subgoal_id=subgoal.id,
+            instruction=subgoal.instruction,
+            step=step,
+            timestamp=datetime.now().isoformat(timespec="seconds"),
+            raw_vla=raw_action,
+            action_type=action.action_type,
+            action_distance_m=action.distance_m,
+            action_angle_deg=action.angle_deg,
+            action_lateral_m=action.lateral_m,
+            frame_path=state.frame_path,
+            robot_state={
+                "position": state.position,
+                "mode": state.mode,
+                "battery": state.battery,
+                "obstacle": state.obstacle,
+                "remaining_distance_m": state.remaining_distance_m,
+            },
+        )
 
     def execute(self, subgoal: SubGoal) -> ExecutionOutcome:
         self.robot.begin_subgoal(subgoal)
@@ -323,34 +358,77 @@ class VLAExecutor:
 
             frames = self.robot.recent_frames(self.frame_buffer_size)
             raw_action = self.policy.predict(subgoal.instruction, frames, state)
+            raw_text = (
+                raw_action
+                if isinstance(raw_action, str)
+                else raw_action.describe()
+            )
             action = (
                 raw_action
                 if isinstance(raw_action, MidLevelAction)
                 else parse_action(raw_action)
             )
-
-            if action.action_type == "stop":
-                self.robot.mark_complete()
-                event = self._emit(
-                    ExecutionEvent(
-                        type=EventType.SUBGOAL_COMPLETED,
-                        subgoal_id=subgoal.id,
-                        message="VLA 返回 stop，子目标完成。",
-                        step_count=step,
-                        state=self.robot.observe(),
-                    )
-                )
-                return ExecutionOutcome(event=event, action_trace=trace)
+            record = self._step_record(subgoal, step, state, raw_text, action)
 
             trace.append(action)
             try:
                 self.robot.execute(action)
             except RobotTransportError as exc:
+                record.command = getattr(self.robot, "last_command", None)
+                record.command_response = getattr(
+                    self.robot, "last_command_response", None
+                )
+                self._emit_step(record)
                 event = self._emit(
                     ExecutionEvent(
                         type=EventType.SAFETY_STOP,
                         subgoal_id=subgoal.id,
                         message=f"机器人通信失败，已触发安全停止：{exc}",
+                        step_count=step,
+                        state=state,
+                    )
+                )
+                return ExecutionOutcome(event=event, action_trace=trace)
+
+            record.command = getattr(self.robot, "last_command", None)
+            record.command_response = getattr(
+                self.robot, "last_command_response", None
+            )
+            self._emit_step(record)
+
+            if action.action_type == "stop":
+                instruction = subgoal.instruction.lower()
+                turn_only = "turn" in instruction and not any(
+                    keyword in instruction
+                    for keyword in ("walk", "move", "go ", "proceed", "forward")
+                )
+                if (
+                    step <= 1
+                    and state.remaining_distance_m > 1.0
+                    and not turn_only
+                ):
+                    event = self._emit(
+                        ExecutionEvent(
+                            type=EventType.UNCERTAIN,
+                            subgoal_id=subgoal.id,
+                            message=(
+                                "VLA 在第一步返回 stop，但估计剩余距离 "
+                                f"{state.remaining_distance_m:.2f}m，请求重新规划。"
+                            ),
+                            step_count=step,
+                            state=state,
+                        )
+                    )
+                    return ExecutionOutcome(event=event, action_trace=trace)
+                self.robot.mark_complete()
+                event = self._emit(
+                    ExecutionEvent(
+                        type=EventType.SUBGOAL_COMPLETED,
+                        subgoal_id=subgoal.id,
+                        message=(
+                            "VLA 返回 stop，且剩余距离已接近目标，"
+                            "子目标完成。"
+                        ),
                         step_count=step,
                         state=state,
                     )
