@@ -95,40 +95,21 @@ def compose_video(
     output_path: str | Path,
     fps: float = 4.0,
 ) -> Path | None:
-    """Compose an mp4 from JPEG/PNG frames at a fixed frame rate."""
-    default = 1.0 / max(fps, 0.1)
-    return compose_timeline(
-        [(path, default) for path in frame_paths],
-        output_path,
-    )
-
-
-def compose_timeline(
-    entries: Iterable[tuple[str | Path, float]],
-    output_path: str | Path,
-) -> Path | None:
-    """Compose an mp4 where every image keeps its own on-screen duration.
-
-    A slower per-image duration is what makes the PPT videos pausable: each
-    annotated step stays visible long enough to talk over it.
-    """
-    frames: list[tuple[Path, float]] = []
-    for path, duration in entries:
-        candidate = Path(path)
-        if candidate.is_file():
-            frames.append((candidate, max(float(duration), 0.04)))
+    """Compose an mp4 from JPEG/PNG frames with ffmpeg."""
+    frames = [Path(path) for path in frame_paths if Path(path).is_file()]
     if not frames:
         return None
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
+    duration = 1.0 / max(fps, 0.1)
     concat_file = output.with_suffix(".ffconcat")
 
     with concat_file.open("w", encoding="utf-8") as handle:
-        for frame, duration in frames:
+        for frame in frames:
             handle.write(f"file '{frame.resolve().as_posix()}'\n")
             handle.write(f"duration {duration:.4f}\n")
-        handle.write(f"file '{frames[-1][0].resolve().as_posix()}'\n")
+        handle.write(f"file '{frames[-1].resolve().as_posix()}'\n")
 
     command = [
         "ffmpeg",

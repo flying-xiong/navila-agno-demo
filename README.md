@@ -17,7 +17,7 @@
                                     ▼
 ┌──────────────────────────────────────────────────────────┐
 │ VLAExecutor（闭环运行）                                    │
-│   历史帧缓冲 → NaVILA policy → action → robot              │
+│   frame ring buffer → NaVILA policy → action → robot      │
 └───────────────┬──────────────────────────────┬───────────┘
                 │ 帧 / 状态                      │ Event
                 ▼                                ▼
@@ -30,8 +30,6 @@
 
 - Agno 不进入高频控制循环，只在任务开始、子目标完成或异常事件时介入。
 - NaVILA 通过 HTTP bridge 独立运行，不与 Agno 共用 Python 环境。
-- 帧记忆分两层：robot 按任务累积整段历史帧，bridge 每次推理把它采样成
-  NaVILA 需要的 8 帧片段（见「接入真实 NaVILA」）。
 - 中层动作从 NaVILA 的自由文本解析为结构化动作，再交给机器人底层。
 
 ## 目录
@@ -183,34 +181,10 @@ python demo.py "去 5 楼会议室 A" --supervisor agno --vla http
 ```json
 {
   "instruction": "走到电梯 C 门口并停下",
-  "image_paths": ["hist_0.jpg", "hist_1.jpg", "...", "current.jpg"],
-  "num_video_frames": 8
+  "image_paths": ["hist_0.jpg", "hist_1.jpg", "current.jpg"],
+  "num_video_frames": 3
 }
 ```
-
-`image_paths` 是**整段任务的历史帧**，`num_video_frames` 是目标片段长度
-（`NAVILA_NUM_VIDEO_FRAMES`，默认 8，与 checkpoint 训练时一致）。bridge 负责
-按官方 `sample_and_pad_images` 的语义把历史采样成 8 帧：
-
-- 历史不足 8 帧：前面补黑帧，真实帧一帧不丢；
-- 历史超过 8 帧：`linspace(0, N-1, num=7, endpoint=False)` 在**整段轨迹**上均匀
-  取 7 帧，再拼上最新帧。
-
-采样结果会随 `NavigateResponse.sampled_frame_paths` 返回，`steps.jsonl` 里每步也
-记了 `history_frames` / `video_frames`，方便核对模型到底看到了哪几帧。
-
-### 观测记忆模式
-
-`--frame-memory` 决定 VLA 能看到多少历史（默认 `episode`，即 NaVILA 官方行为）：
-
-| 模式 | 送入 VLA 的帧 | 说明 |
-| --- | --- | --- |
-| `episode` | 整段任务的帧 | 默认。跨度覆盖整条轨迹，走廊起点/经过的门不会被丢掉 |
-| `subgoal` | 当前子目标开始后的帧 | 折中，避免上一个子目标的画面干扰新指令 |
-| `recent` | 最近 `--frame-buffer-size` 帧 | 旧行为，滑动窗口，只保留最近 8 步 |
-
-`--vla lightnav` 时建议用 `recent`：LightNav 的 WebSocket 协议要把历史序列逐帧重放，
-`episode` 会让每步重放开销随任务长度线性增长。
 
 ## 接入 LightNav-0
 
@@ -314,55 +288,11 @@ runs/
 ├── go2/
 │   └── 20260917-153000_去前方会议室/
 │       ├── frames/          # Go2 前视相机帧，按采集顺序命名
-│       ├── annotated/       # 已烧入字幕的帧，可直接插到 PPT 当截图
-│       ├── video.mp4        # 自动合成的 MP4（带字幕，节奏放慢）
+│       ├── video.mp4        # 自动合成的 MP4
 │       ├── steps.jsonl      # 逐步调试记录，每行一个 JSON
 │       └── run.json         # mission / subgoals / steps / events / 视频路径
 └── mock/
     └── ...
-```
-
-### 带字幕的 PPT 视频
-
-默认会把 `任务 / 子目标 / 当前动作` 烧进每一帧，方便对着视频讲“现在走到哪一步”：
-
-- 顶部：任务原文（左）+ 机器人状态（右，例如 `mode=walk`）
-- 底部：`子目标 sg-1 (1/3)`、`step 2/4`、子目标原文、NaVILA 输出的原句、
-  映射出的动作、下发的 Go2 指令、剩余距离与当前位姿
-- 最底边：细进度条表示该子目标内的步数进度
-- 片头是任务卡，片尾是结果卡（成功与否、子目标清单）
-
-节奏靠每步停留时长控制，默认 `--video-hold-s 1.2`（停下动作自动延长 1.6 倍），
-这样每一步都能停下来讲；配合 `--video-intro-s` / `--video-outro-s` 调片头片尾。
-
-```bash
-# 更慢、更适合逐帧讲解
-python demo.py "去前方会议室" \
-  --supervisor agno --vla navila --robot go2 \
-  --go2-endpoint http://10.81.6.68:8013 --no-go2-dry-run \
-  --video-hold-s 2.0
-
-# 不要字幕，回到原始固定帧率
-python demo.py "去前方会议室" --robot go2 --go2-dry-run --no-video-overlay --video-fps 4
-```
-
-已跑完的任务可以离线重渲染，不用再连机器人：
-
-```bash
-python scripts/render_run_video.py runs/go2/20260917-153000_去前方会议室 --hold-s 2.0
-# 输出 runs/go2/<run_id>/video_annotated.mp4 与 annotated/ 下的静帧
-```
-
-字幕用 Pillow 直接画进像素，不走 ffmpeg `drawtext`。原因是这台机器上常见的
-CJK 兜底字体（Droid Sans Fallback）不含任何拉丁字母和数字字形，直接用会把
-所有英文和数字渲染成方框；`navila_agno/overlay.py` 因此按字符在“拉丁字体”和
-“CJK 字体”之间切换，保证中英文都正常。
-
-依赖：`pillow`（已在 `requirements.txt`）。如果当前环境缺 Pillow，`demo.py` 会打印
-提示并自动退回无字幕的固定帧率合成，不会中断任务；补装即可：
-
-```bash
-python -m pip install pillow
 ```
 
 默认开启视频合成，可用参数调整：
@@ -414,29 +344,9 @@ Agno 输出给 NaVILA 的子目标：
   "constraints": ["避开楼梯间", "遇到施工区停下"],
   "completion_criteria": "距电梯门口小于 0.5 米且正对电梯门",
   "max_steps": 8,
-  "estimated_distance_m": 2.0,
-  "stop_condition": {
-    "kind": "vla_stop_after_distance",
-    "distance_m": 2.0,
-    "description": "走到电梯 C 门口并停下"
-  }
+  "estimated_distance_m": 2.0
 }
 ```
-
-`stop_condition` 是执行器判断子目标何时结束的唯一依据，四类取值：
-
-- `vla_stop_after_distance`：VLA 说 stop **且**走够 `distance_m`。粗粒度、
-  以地标结尾的段落的默认规则。`distance_m` 同时是下限（提前 stop 会交回重规划）
-  和上限（超预算 30% 仍没等到 stop 也会交回），所以估计宁可略大。
-- `distance`：走够 `distance_m` 就停，不等 VLA。适合沿走廊直行的固定段落。
-- `steps`：执行固定步数。只用于既不需要识别地标、也不用判断转向是否到位的段落。
-- `vla_stop`：完全信任 VLA 的 stop。只用于几米内、外观极明确的目标。
-
-分解原则是**宁粗勿细**：模型写不出可判定停止条件的切分点会被自动并入前一段；
-用步数表示"转向完成"也会被并入（步数无法证明转到位）。
-近期的 dry-run 记录见 `runs/go2/`：`20260917-144205_coarse-merge` 里合并后的
-长段一直等不到 VLA 的 stop，共走 82 步、3 次耗尽 `max_steps` 硬失败；
-`20260917-150617_coarse-final` 用同一任务只走 33 步，超过预算就交回 Agno 重规划。
 
 Executor 发出的事件：
 
@@ -451,8 +361,6 @@ need_help
 
 ## 下一步
 
-- NaVILA 记忆已对齐官方（全历史 + 8 帧均匀采样）；下一步接你 NaVILA 分支里的
-  子模记忆采样器 `llava/vlnce_memory_sampler.py`，与均匀采样做 A/B 对比。
 - 将 `Go2HttpRobot` 的相机帧接入 Go2 bridge `/frame` 的连续流/ROS2 vision bridge。
 - 用真实室内语义图或地图 API 扩展 `map_route`，替代当前确定性 waypoint。
 - 用 LightNav-0 的 `robot_deploy/` MPC 控制器验证 waypoint 到 Go2 步态的执行层。

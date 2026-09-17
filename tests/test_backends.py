@@ -1,7 +1,5 @@
 import unittest
 import tempfile
-import os
-from pathlib import Path
 
 from navila_agno.contracts import MidLevelAction, RobotState, SubGoal
 from navila_agno.robot import Go2HttpRobot, MockRobot, action_to_go2_command
@@ -13,7 +11,6 @@ from navila_agno.vla import (
     build_navila_payload,
     lightnav_waypoint_to_action,
     make_vla,
-    navila_video_frames,
 )
 
 
@@ -40,20 +37,7 @@ class NavilaPayloadTests(unittest.TestCase):
             "go forward", ["a.jpg", "b.jpg"], None
         )
         self.assertEqual(payload["instruction"], "go forward")
-        # The whole history travels to the bridge, which samples it down to
-        # the clip length the checkpoint was trained with.
-        self.assertEqual(payload["image_paths"], ["a.jpg", "b.jpg"])
-        self.assertEqual(payload["num_video_frames"], 8)
-
-    def test_video_frames_override(self) -> None:
-        os.environ["NAVILA_NUM_VIDEO_FRAMES"] = "4"
-        try:
-            self.assertEqual(navila_video_frames(), 4)
-            payload = build_navila_payload("go", ["a.jpg"], None)
-            self.assertEqual(payload["num_video_frames"], 4)
-        finally:
-            os.environ.pop("NAVILA_NUM_VIDEO_FRAMES", None)
-        self.assertEqual(navila_video_frames(), 8)
+        self.assertEqual(payload["num_video_frames"], 2)
 
 
 class LightNavActionTests(unittest.TestCase):
@@ -122,25 +106,6 @@ class RobotLifecycleTests(unittest.TestCase):
             )
             state = robot.observe()
         self.assertIsInstance(state, RobotState)
-
-    def test_observe_falls_back_to_previous_frame(self) -> None:
-        """A failed /frame must not hand the VLA an empty observation."""
-        with tempfile.TemporaryDirectory() as frame_dir:
-            robot = Go2HttpRobot(
-                endpoint="http://127.0.0.1:1",
-                dry_run=True,
-                timeout_s=0.2,
-                max_retries=1,
-                connect_timeout_s=0.2,
-                frame_dir=frame_dir,
-            )
-            # Pretend an earlier step captured a frame successfully.
-            previous = Path(frame_dir) / "sg-1_step0000.jpg"
-            previous.write_bytes(b"jpeg")
-            robot._history.append(str(previous))
-            robot._frames.append(str(previous))
-            state = robot.observe()
-        self.assertEqual(state.frame_path, str(previous))
 
 
 if __name__ == "__main__":

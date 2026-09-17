@@ -108,22 +108,7 @@ def main() -> None:
         "--frame-buffer-size",
         type=int,
         default=8,
-        help="--frame-memory=recent 时的滑动窗口大小",
-    )
-    parser.add_argument(
-        "--frame-memory",
-        choices=["episode", "subgoal", "recent"],
-        default="episode",
-        help=(
-            "VLA 能看到的观测历史：episode=整段任务（NaVILA 官方记忆，"
-            "由 bridge 均匀采样成 8 帧）、subgoal=当前子目标内、recent=最近 N 帧"
-        ),
-    )
-    parser.add_argument(
-        "--num-video-frames",
-        type=int,
-        default=None,
-        help="NaVILA 每次推理的片段长度，默认 8（与 checkpoint 训练一致）",
+        help="NaVILA 最近观测帧窗口大小",
     )
     parser.add_argument(
         "--memory",
@@ -150,36 +135,9 @@ def main() -> None:
         "--video-fps",
         type=float,
         default=4.0,
-        help="关闭字幕时的视频帧率，真实推理较慢时建议 3~5",
-    )
-    parser.add_argument(
-        "--video-overlay",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="把任务/子目标/当前动作烧进每一帧（PPT 展示用）",
-    )
-    parser.add_argument(
-        "--video-hold-s",
-        type=float,
-        default=1.2,
-        help="每一步画面停留的秒数，越大越慢，方便暂停讲解",
-    )
-    parser.add_argument(
-        "--video-intro-s",
-        type=float,
-        default=3.0,
-        help="片头任务卡停留秒数",
-    )
-    parser.add_argument(
-        "--video-outro-s",
-        type=float,
-        default=4.0,
-        help="片尾结果卡停留秒数",
+        help="视频合成帧率，真实推理较慢时建议 3~5",
     )
     args = parser.parse_args()
-
-    if args.num_video_frames is not None:
-        os.environ["NAVILA_NUM_VIDEO_FRAMES"] = str(args.num_video_frames)
 
     step_records: list[dict[str, object]] = []
 
@@ -190,21 +148,10 @@ def main() -> None:
             f"vla={record.raw_vla[:60]!r} -> {record.action_type}"
         )
 
-    subgoal_meta: dict[str, dict[str, object]] = {}
-
     def _on_subgoal(subgoal: object) -> None:
-        subgoal_meta[subgoal.id] = {
-            "index": len(subgoal_meta) + 1,
-            "instruction": subgoal.instruction,
-            "max_steps": subgoal.max_steps,
-            "estimated_distance_m": subgoal.estimated_distance_m,
-            "stop_condition": subgoal.stop_condition.describe(),
-            "stop_kind": subgoal.stop_condition.kind,
-        }
         print(
             f"  [subgoal] {subgoal.id}: {subgoal.instruction} "
-            f"(max_steps={subgoal.max_steps}, est={subgoal.estimated_distance_m}, "
-            f"stop={subgoal.stop_condition.describe()})"
+            f"(max_steps={subgoal.max_steps}, est={subgoal.estimated_distance_m})"
         )
 
     artifacts = RunArtifacts.create(
@@ -233,7 +180,6 @@ def main() -> None:
         policy=policy,
         robot=robot,
         frame_buffer_size=args.frame_buffer_size,
-        frame_memory=args.frame_memory,
         on_event=_on_event,
         on_step=_on_step,
         on_subgoal=_on_subgoal,
@@ -257,65 +203,11 @@ def main() -> None:
     artifacts.write_steps(step_records)
     video_path = None
     if args.record_video and recorded_frames:
-        total_subgoals = len(subgoal_meta)
-        for meta in subgoal_meta.values():
-            meta["total"] = total_subgoals
-        if args.video_overlay:
-            try:
-                from navila_agno.video import build_timeline, render_video
-            except ImportError as exc:
-                # Pillow is only needed for the burned-in subtitles; a missing
-                # optional dependency must not abort the whole mission.
-                print(
-                    f"[demo] 字幕视频不可用（{exc}）。"
-                    "安装后重试：python -m pip install pillow"
-                )
-                args.video_overlay = False
-        if args.video_overlay:
-            timeline = build_timeline(
-                recorded_frames,
-                step_records,
-                subgoal_meta,
-                args.mission,
-                hold_s=args.video_hold_s,
-            )
-            video_path = render_video(
-                timeline,
-                artifacts.video_path,
-                artifacts.run_dir / "annotated",
-                intro=(
-                    args.mission,
-                    f"NaVILA × Agno  |  {total_subgoals} 个子目标  |  {len(step_records)} 步",
-                    [
-                        f"supervisor={type(supervisor).__name__}"
-                        f"   vla={type(policy).__name__}"
-                        f"   robot={type(robot).__name__}",
-                        "Agno 负责高层任务分解，NaVILA 负责逐步视觉语言导航；"
-                        "每步画面下方为当前子目标与 VLA 输出。",
-                    ],
-                ),
-                intro_s=args.video_intro_s,
-                outro=(
-                    "任务结束" if report.success else "任务未完成",
-                    args.mission,
-                    [
-                        f"成功：{'是' if report.success else '否'}"
-                        f"   完成子目标：{report.completed_subgoals}/{report.subgoals_total}",
-                        f"总步数：{len(step_records)}   事件数：{len(report.events)}",
-                    ]
-                    + [
-                        f"子目标 {sid}：{meta['instruction']}"
-                        for sid, meta in subgoal_meta.items()
-                    ],
-                ),
-                outro_s=args.video_outro_s,
-            )
-        else:
-            video_path = compose_video(
-                recorded_frames,
-                artifacts.video_path,
-                fps=args.video_fps,
-            )
+        video_path = compose_video(
+            recorded_frames,
+            artifacts.video_path,
+            fps=args.video_fps,
+        )
 
     artifacts.write_metadata(
         {
@@ -332,15 +224,6 @@ def main() -> None:
             ),
             "steps": step_records,
             "steps_file": str(artifacts.steps_path),
-            "frame_order": recorded_frames,
-            "video_overlay": bool(args.video_overlay),
-            "video_hold_s": args.video_hold_s,
-            "annotated_frames": (
-                str((artifacts.run_dir / "annotated").resolve())
-                if args.video_overlay
-                else None
-            ),
-            "subgoal_meta": subgoal_meta,
             "events": [
                 {
                     "type": event.type.value,

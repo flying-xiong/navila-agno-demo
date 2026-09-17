@@ -24,8 +24,6 @@ class RobotCommandError(RobotTransportError):
 
 
 class RobotInterface(Protocol):
-    def begin_mission(self) -> None: ...
-
     def begin_subgoal(self, subgoal: SubGoal) -> None: ...
 
     def observe(self) -> RobotState: ...
@@ -33,10 +31,6 @@ class RobotInterface(Protocol):
     def execute(self, action: MidLevelAction) -> RobotState: ...
 
     def recent_frames(self, n: int) -> list[str]: ...
-
-    def mission_frames(self) -> list[str]: ...
-
-    def subgoal_frames(self) -> list[str]: ...
 
     def is_complete(self, subgoal: SubGoal, state: RobotState) -> bool: ...
 
@@ -56,44 +50,16 @@ class MockRobot:
         self.current_subgoal: SubGoal | None = None
         self.step = 0
         self.remaining_distance_m = 0.0
-        self._estimated_distance_m = 0.0
-        #: Distance actually covered since this subgoal started. It is a plain
-        #: accumulator on purpose: it must be able to exceed the supervisor's
-        #: estimate, otherwise an over-long segment can never be detected.
-        self.traveled_m = 0.0
         self.complete = False
         self._frames: deque[str] = deque([f"mock://frame/{self.step}"], maxlen=32)
-        # Mission-scoped history: NaVILA's memory spans the whole trajectory,
-        # so it must survive subgoal boundaries.
-        self._history: list[str] = []
-        self._subgoal_start = 0
-
-    def begin_mission(self) -> None:
-        self._history.clear()
-        self._subgoal_start = 0
-        self._record_frame()
-
-    def _record_frame(self) -> None:
-        frame = f"mock://frame/{self.step}"
-        self._frames.append(frame)
-        self._history.append(frame)
-
-    def mission_frames(self) -> list[str]:
-        return list(self._history)
-
-    def subgoal_frames(self) -> list[str]:
-        return list(self._history[self._subgoal_start :])
 
     def begin_subgoal(self, subgoal: SubGoal) -> None:
         self.current_subgoal = subgoal
         self.step = 0
         self.complete = False
-        self._estimated_distance_m = subgoal.estimated_distance_m or 1.0
-        self.remaining_distance_m = self._estimated_distance_m
-        self.traveled_m = 0.0
+        self.remaining_distance_m = subgoal.estimated_distance_m or 1.0
         self._frames.clear()
         self._frames.append(f"mock://frame/{self.step}")
-        self._subgoal_start = max(0, len(self._history) - 1)
 
     def observe(self) -> RobotState:
         obstacle = (
@@ -109,17 +75,15 @@ class MockRobot:
             frame_path=self._frames[-1],
             obstacle=obstacle,
             remaining_distance_m=self.remaining_distance_m,
-            traveled_m=self.traveled_m,
         )
 
     def execute(self, action: MidLevelAction) -> RobotState:
         if action.action_type in {"move_forward", "move"}:
-            self.traveled_m += max(action.distance_m, 0.0)
             self.remaining_distance_m = max(
-                0.0, self._estimated_distance_m - self.traveled_m
+                0.0, self.remaining_distance_m - max(action.distance_m, 0.0)
             )
         self.step += 1
-        self._record_frame()
+        self._frames.append(f"mock://frame/{self.step}")
         return self.observe()
 
     def recent_frames(self, n: int) -> list[str]:
@@ -130,7 +94,6 @@ class MockRobot:
 
     def mark_complete(self) -> None:
         self.complete = True
-        self.traveled_m = self._estimated_distance_m
         self.remaining_distance_m = 0.0
 
 
@@ -266,33 +229,14 @@ class Go2HttpRobot:
         self.step = 0
         self.remaining_distance_m = 0.0
         self._estimated_distance_m = 0.0
-        #: Real odometry when the robot reports a pose, otherwise the sum of the
-        #: commanded distances. Never clamped to the supervisor's estimate.
-        self.traveled_m = 0.0
         self._start_position: dict[str, Any] | None = None
         self.complete = False
         self._frames: deque[str] = deque(maxlen=32)
-        # Mission-scoped history of every captured frame. NaVILA samples this
-        # down to a fixed clip, so it has to keep the whole trajectory rather
-        # than a sliding window.
-        self._history: list[str] = []
-        self._subgoal_start = 0
         self.recorded_frames: list[str] = []
         self.last_command: dict[str, Any] | None = None
         self.last_command_response: dict[str, Any] | None = None
 
-    def begin_mission(self) -> None:
-        self._history.clear()
-        self._subgoal_start = 0
-
-    def mission_frames(self) -> list[str]:
-        return list(self._history)
-
-    def subgoal_frames(self) -> list[str]:
-        return list(self._history[self._subgoal_start :])
-
     def begin_subgoal(self, subgoal: SubGoal) -> None:
-        self._subgoal_start = len(self._history)
         self.current_subgoal = subgoal
         self.step = 0
         self.complete = False
@@ -302,7 +246,6 @@ class Go2HttpRobot:
             else 1.0
         )
         self.remaining_distance_m = self._estimated_distance_m
-        self.traveled_m = 0.0
         self._start_position = None
         try:
             data = self._get_json("/state")
@@ -336,20 +279,9 @@ class Go2HttpRobot:
                 return response
             except httpx.HTTPStatusError as exc:
                 body = exc.response.text[:200]
-                status = exc.response.status_code
-                if status < 500:
-                    # 4xx means the request itself is wrong (e.g. a field that
-                    # fails bridge validation); retrying cannot help.
-                    raise RobotTransportError(
-                        f"{method} {path} 返回 HTTP {status}: {body}"
-                    ) from exc
-                # 5xx is the bridge telling us it is not ready yet (the camera
-                # frame buffer, for instance). Retry like a transport error.
-                last_error = RobotTransportError(
-                    f"{method} {path} 返回 HTTP {status}: {body}"
-                )
-                if attempt < self.max_retries:
-                    time.sleep(self.retry_backoff_s * attempt)
+                raise RobotTransportError(
+                    f"{method} {path} 返回 HTTP {exc.response.status_code}: {body}"
+                ) from exc
             except (
                 httpx.ConnectError,
                 httpx.ConnectTimeout,
@@ -376,7 +308,6 @@ class Go2HttpRobot:
         try:
             response = self._request("GET", "/frame")
             if not response.content:
-                print("[go2] /frame 返回空图像，沿用上一帧")
                 return ""
             name = (
                 f"{self.current_subgoal.id if self.current_subgoal else 'mission'}"
@@ -386,17 +317,10 @@ class Go2HttpRobot:
             path.write_bytes(response.content)
             resolved = str(path.resolve())
             self._frames.append(resolved)
-            if not self._history or self._history[-1] != resolved:
-                self._history.append(resolved)
             if not self.recorded_frames or self.recorded_frames[-1] != resolved:
                 self.recorded_frames.append(resolved)
             return resolved
-        except Exception as exc:  # noqa: BLE001 - a missing frame must not abort
-            # Silent failures here are dangerous: with no frame at all the VLA
-            # reasons over nothing and answers "stop", which looks exactly like
-            # a finished subgoal. Surface it; observe() falls back to the last
-            # frame it still holds.
-            print(f"[go2] 取帧失败，沿用上一帧：{type(exc).__name__}: {exc}")
+        except Exception:
             return ""
 
     def observe(self) -> RobotState:
@@ -408,19 +332,10 @@ class Go2HttpRobot:
         except Exception:
             state_data = {}
 
-        # Fall back to the most recent frame we still hold. Handing the VLA an
-        # empty path makes it reason over nothing and answer "stop", which
-        # looks exactly like a finished subgoal.
-        frame_path = self._fetch_frame()
-        if not frame_path:
-            for candidate in (self._frames, self._history):
-                if candidate:
-                    frame_path = candidate[-1]
-                    break
+        frame_path = self._fetch_frame() or (self._frames[-1] if self._frames else "")
         position = _as_position(state_data.get("position", {"x": self.step}))
         if self._start_position is not None and not self.dry_run:
             traveled = _distance_between(self._start_position, position)
-            self.traveled_m = traveled
             self.remaining_distance_m = max(
                 0.0,
                 self._estimated_distance_m - traveled,
@@ -442,7 +357,6 @@ class Go2HttpRobot:
             frame_path=frame_path,
             obstacle=obstacle,
             remaining_distance_m=self.remaining_distance_m,
-            traveled_m=self.traveled_m,
         )
 
     def _send_action(self, action: MidLevelAction) -> None:
@@ -491,9 +405,8 @@ class Go2HttpRobot:
             self.dry_run
             or self._start_position is None
         ) and action.action_type in {"move_forward", "move"}:
-            self.traveled_m += max(action.distance_m, 0.0)
             self.remaining_distance_m = max(
-                0.0, self._estimated_distance_m - self.traveled_m
+                0.0, self.remaining_distance_m - max(action.distance_m, 0.0)
             )
         self.step += 1
         return self.observe()
@@ -506,5 +419,4 @@ class Go2HttpRobot:
 
     def mark_complete(self) -> None:
         self.complete = True
-        self.traveled_m = self._estimated_distance_m
         self.remaining_distance_m = 0.0
