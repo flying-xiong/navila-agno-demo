@@ -246,6 +246,30 @@ Go2 bridge 提供的接口：
 Go2 SDK 尚未安装时，bridge 仍可启动，`/state` 会返回 `available=false`，
 `demo.py --go2-dry-run` 可继续验证上层流程。
 
+### 真机运动排查
+
+真机运动前先确认链路质量：
+
+```bash
+ping -c 20 10.81.6.68
+curl -w '\nhttp=%{http_code} time=%{time_total}\n' http://10.81.6.68:8013/health
+curl -w '\nhttp=%{http_code} size=%{size_download} time=%{time_total}\n' \
+  http://10.81.6.68:8013/frame -o /tmp/go2_frame.jpg
+```
+
+- 建议 `ping` 丢包为 0%，`/health` 响应小于 1 秒。
+- 如果客户端报 `httpx.ConnectTimeout`，通常是 Go2 WiFi 丢包或 bridge 被阻塞，不是运动指令本身的问题。
+- Go2 端 bridge 会返回 `rc` 和 `stop_rc`；`rc != 0` 表示 SDK 拒绝了运动指令。
+- 客户端对 `/state`、`/frame`、`/move` 默认重试 3 次；重试仍失败会触发 `safety_stop` 事件并调用 `/stop`。
+
+可用环境变量：
+
+```bash
+export GO2_FRAME_MAX_WIDTH=1280      # 0 表示不缩放，降低 WiFi 带宽
+export GO2_FRAME_JPEG_QUALITY=80
+export GO2_MOVE_WATCHDOG_GRACE_S=0.5 # /move 卡住时的兜底停止时间
+```
+
 ## 运行产物与视频
 
 每次 `demo.py` 运行都会创建独立目录：

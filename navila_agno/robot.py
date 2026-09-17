@@ -3,11 +3,20 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any, Protocol
 
 from .contracts import MidLevelAction, RobotState, SubGoal
+
+
+class RobotTransportError(RuntimeError):
+    """Raised when the HTTP bridge cannot be reached after retries."""
+
+
+class RobotCommandError(RobotTransportError):
+    """Raised when the Go2 SDK rejects a motion command."""
 
 
 class RobotInterface(Protocol):
@@ -176,6 +185,9 @@ class Go2HttpRobot:
         max_lateral_speed_mps: float = 0.30,
         max_yaw_speed_deg_per_s: float = 80.0,
         waypoint_duration_s: float = 0.50,
+        max_retries: int = 3,
+        retry_backoff_s: float = 0.5,
+        connect_timeout_s: float = 5.0,
     ) -> None:
         self.endpoint = endpoint.rstrip("/")
         self.timeout_s = timeout_s
@@ -188,6 +200,9 @@ class Go2HttpRobot:
         self.max_lateral_speed_mps = max_lateral_speed_mps
         self.max_yaw_speed_deg_per_s = max_yaw_speed_deg_per_s
         self.waypoint_duration_s = waypoint_duration_s
+        self.max_retries = max(1, max_retries)
+        self.retry_backoff_s = max(0.0, retry_backoff_s)
+        self.connect_timeout_s = max(0.5, connect_timeout_s)
 
         self.current_subgoal: SubGoal | None = None
         self.step = 0
@@ -203,38 +218,52 @@ class Go2HttpRobot:
         self.remaining_distance_m = subgoal.estimated_distance_m or 1.0
         self._frames.clear()
 
-    def _get_json(self, path: str) -> dict[str, Any]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Any:
         import httpx
 
-        response = httpx.get(
-            f"{self.endpoint}{path}",
-            timeout=self.timeout_s,
-        )
-        response.raise_for_status()
-        return response.json()
+        url = f"{self.endpoint}{path}"
+        timeout = httpx.Timeout(self.timeout_s, connect=self.connect_timeout_s)
+        last_error: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                response = httpx.request(
+                    method,
+                    url,
+                    json=payload,
+                    timeout=timeout,
+                )
+                response.raise_for_status()
+                return response
+            except (
+                httpx.ConnectError,
+                httpx.ConnectTimeout,
+                httpx.ReadTimeout,
+                httpx.RemoteProtocolError,
+                httpx.WriteError,
+            ) as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_backoff_s * attempt)
+        raise RobotTransportError(
+            f"{method} {path} 失败（已重试 {self.max_retries} 次）：{last_error}"
+        ) from last_error
+
+    def _get_json(self, path: str) -> dict[str, Any]:
+        return self._request("GET", path).json()
 
     def _post_json(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        import httpx
-
-        response = httpx.post(
-            f"{self.endpoint}{path}",
-            json=payload,
-            timeout=self.timeout_s,
-        )
-        response.raise_for_status()
-        return response.json()
+        return self._request("POST", path, payload).json()
 
     def _fetch_frame(self) -> str:
         if not self.frame_fetch:
             return ""
         try:
-            import httpx
-
-            response = httpx.get(
-                f"{self.endpoint}/frame",
-                timeout=self.timeout_s,
-            )
-            response.raise_for_status()
+            response = self._request("GET", "/frame")
             if not response.content:
                 return ""
             name = (
@@ -302,7 +331,20 @@ class Go2HttpRobot:
         if action.action_type == "stop":
             self._post_json("/stop", {})
             return
-        self._post_json("/move", command)
+        try:
+            response = self._post_json("/move", command)
+            rc = int(response.get("rc", 0) or 0)
+            if rc != 0:
+                raise RobotCommandError(f"Go2 Move 返回错误码 rc={rc}")
+        except RobotTransportError:
+            self._stop_safely()
+            raise
+
+    def _stop_safely(self) -> None:
+        try:
+            self._post_json("/stop", {})
+        except Exception:  # noqa: BLE001 - best effort safety stop
+            return
 
     def execute(self, action: MidLevelAction) -> RobotState:
         self._send_action(action)

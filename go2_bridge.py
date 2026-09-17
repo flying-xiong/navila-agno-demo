@@ -24,6 +24,9 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="Unitree Go2 Bridge", version="0.1.0")
 
 OBSTACLE_STOP_DISTANCE_M = float(os.getenv("GO2_OBSTACLE_STOP_DISTANCE_M", "0.6"))
+FRAME_MAX_WIDTH = int(os.getenv("GO2_FRAME_MAX_WIDTH", "1280"))
+FRAME_JPEG_QUALITY = int(os.getenv("GO2_FRAME_JPEG_QUALITY", "80"))
+MOVE_WATCHDOG_GRACE_S = float(os.getenv("GO2_MOVE_WATCHDOG_GRACE_S", "0.5"))
 
 
 class MoveRequest(BaseModel):
@@ -42,9 +45,14 @@ class Go2SDK:
         self.motion_enabled = os.getenv("ENABLE_MOTION", "0") == "1"
         self.video_enabled = os.getenv("ENABLE_VIDEO", "1") == "1"
         self._lock = threading.Lock()
+        self._frame_lock = threading.Lock()
         self._initialized = False
         self._sport_client: Any = None
         self._video_client: Any = None
+        self._frame_thread: Optional[threading.Thread] = None
+        self._frame_stop = threading.Event()
+        self._latest_frame: Optional[bytes] = None
+        self._latest_frame_time = 0.0
         self._state: dict[str, Any] = {
             "position": [0.0, 0.0, 0.0],
             "velocity": [0.0, 0.0, 0.0],
@@ -95,6 +103,12 @@ class Go2SDK:
                 self._video_client = VideoClient()
                 self._video_client.SetTimeout(3.0)
                 self._video_client.Init()
+                self._frame_thread = threading.Thread(
+                    target=self._frame_loop,
+                    name="go2-frame-cache",
+                    daemon=True,
+                )
+                self._frame_thread.start()
             except Exception as exc:  # noqa: BLE001 - camera is optional
                 print(f"[go2-bridge] 相机初始化失败（继续无图像模式）：{exc}")
                 self._video_client = None
@@ -124,27 +138,52 @@ class Go2SDK:
         if not self.ensure_initialized() or self._sport_client is None:
             raise HTTPException(status_code=503, detail="Go2 SDK 不可用")
 
-        self._sport_client.Move(req.vx, req.vy, req.vyaw)
-        if req.duration_sec > 0:
-            time.sleep(req.duration_sec)
-        self._sport_client.StopMove()
-        return _move_response(req, dry_run=False)
+        move_rc = -1
+        stop_rc = -1
+        watchdog = threading.Timer(
+            max(req.duration_sec, 0.1) + MOVE_WATCHDOG_GRACE_S,
+            self._stop_move_safely,
+        )
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            move_rc = int(self._sport_client.Move(req.vx, req.vy, req.vyaw))
+            if req.duration_sec > 0:
+                time.sleep(req.duration_sec)
+        except Exception as exc:  # noqa: BLE001 - report SDK failure to client
+            raise HTTPException(status_code=502, detail=f"Go2 Move 调用失败：{exc}") from exc
+        finally:
+            watchdog.cancel()
+            stop_rc = self._stop_move_safely()
+        return _move_response(
+            req,
+            dry_run=False,
+            move_rc=move_rc,
+            stop_rc=stop_rc,
+        )
+
+    def _stop_move_safely(self) -> int:
+        try:
+            if self._sport_client is None:
+                return -1
+            return int(self._sport_client.StopMove())
+        except Exception:  # noqa: BLE001 - best effort safety stop
+            return -1
 
     def stop(self) -> dict[str, Any]:
-        if self.ensure_initialized() and self._sport_client is not None:
-            self._sport_client.StopMove()
-        return {"rc": 0, "msg": "ok"}
+        self.ensure_initialized()
+        return {"rc": self._stop_move_safely(), "msg": "ok"}
 
     def stand_up(self) -> dict[str, Any]:
         if not self.motion_enabled:
             raise HTTPException(status_code=403, detail="ENABLE_MOTION 未开启")
         if self.ensure_initialized() and self._sport_client is not None:
-            self._sport_client.StandUp()
+            return {"rc": int(self._sport_client.StandUp()), "msg": "ok"}
         return {"rc": 0, "msg": "ok"}
 
     def damp(self) -> dict[str, Any]:
         if self.ensure_initialized() and self._sport_client is not None:
-            self._sport_client.Damp()
+            return {"rc": int(self._sport_client.Damp()), "msg": "ok"}
         return {"rc": 0, "msg": "ok"}
 
     def get_state(self) -> dict[str, Any]:
@@ -156,19 +195,42 @@ class Go2SDK:
         }
 
     def get_frame(self) -> bytes:
-        if not self.video_enabled or not self.ensure_initialized():
+        self.ensure_initialized()
+        if not self.video_enabled or self._video_client is None:
             raise HTTPException(status_code=503, detail="相机不可用")
-        if self._video_client is None:
-            raise HTTPException(status_code=503, detail="相机未初始化")
-        code, data = self._video_client.GetImageSample()
-        if code != 0:
-            raise HTTPException(status_code=502, detail=f"Go2 相机错误码：{code}")
-        return bytes(data)
+        with self._frame_lock:
+            frame = self._latest_frame
+        if frame is None:
+            raise HTTPException(status_code=503, detail="相机帧尚未就绪")
+        return frame
+
+    def _frame_loop(self) -> None:
+        while not self._frame_stop.is_set():
+            try:
+                if self._video_client is None:
+                    return
+                code, data = self._video_client.GetImageSample()
+                if code == 0 and data:
+                    frame = _encode_frame(bytes(data))
+                    with self._frame_lock:
+                        self._latest_frame = frame
+                        self._latest_frame_time = time.time()
+                else:
+                    time.sleep(0.1)
+            except Exception as exc:  # noqa: BLE001 - keep video loop alive
+                print(f"[go2-bridge] 取帧失败：{type(exc).__name__}: {exc}")
+                time.sleep(0.5)
 
 
-def _move_response(req: MoveRequest, dry_run: bool) -> dict[str, Any]:
+def _move_response(
+    req: MoveRequest,
+    dry_run: bool,
+    move_rc: int = 0,
+    stop_rc: int = 0,
+) -> dict[str, Any]:
     return {
-        "rc": 0,
+        "rc": move_rc,
+        "stop_rc": stop_rc,
         "msg": "dry_run" if dry_run else "ok",
         "dry_run": dry_run,
         "vx": req.vx,
@@ -176,6 +238,36 @@ def _move_response(req: MoveRequest, dry_run: bool) -> dict[str, Any]:
         "vyaw": req.vyaw,
         "duration_sec": req.duration_sec,
     }
+
+
+def _encode_frame(data: bytes) -> bytes:
+    if FRAME_MAX_WIDTH <= 0:
+        return data
+    try:
+        import cv2
+        import numpy as np
+    except Exception:  # noqa: BLE001 - optional dependency
+        return data
+    try:
+        image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            return data
+        height, width = image.shape[:2]
+        if width > FRAME_MAX_WIDTH:
+            scale = FRAME_MAX_WIDTH / float(width)
+            image = cv2.resize(
+                image,
+                (FRAME_MAX_WIDTH, int(height * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+        ok, encoded = cv2.imencode(
+            ".jpg",
+            image,
+            [int(cv2.IMWRITE_JPEG_QUALITY), FRAME_JPEG_QUALITY],
+        )
+        return encoded.tobytes() if ok else data
+    except Exception:  # noqa: BLE001 - fall back to raw JPEG
+        return data
 
 
 def _to_list(value: Any, size: int) -> list[float]:

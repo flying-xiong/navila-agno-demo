@@ -29,7 +29,7 @@ from .contracts import (
     RobotState,
     SubGoal,
 )
-from .robot import RobotInterface
+from .robot import RobotInterface, RobotTransportError
 
 
 class VLAPolicy(Protocol):
@@ -343,7 +343,19 @@ class VLAExecutor:
                 return ExecutionOutcome(event=event, action_trace=trace)
 
             trace.append(action)
-            self.robot.execute(action)
+            try:
+                self.robot.execute(action)
+            except RobotTransportError as exc:
+                event = self._emit(
+                    ExecutionEvent(
+                        type=EventType.SAFETY_STOP,
+                        subgoal_id=subgoal.id,
+                        message=f"机器人通信失败，已触发安全停止：{exc}",
+                        step_count=step,
+                        state=state,
+                    )
+                )
+                return ExecutionOutcome(event=event, action_trace=trace)
 
         event = self._emit(
             ExecutionEvent(
