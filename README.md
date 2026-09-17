@@ -414,9 +414,29 @@ Agno 输出给 NaVILA 的子目标：
   "constraints": ["避开楼梯间", "遇到施工区停下"],
   "completion_criteria": "距电梯门口小于 0.5 米且正对电梯门",
   "max_steps": 8,
-  "estimated_distance_m": 2.0
+  "estimated_distance_m": 2.0,
+  "stop_condition": {
+    "kind": "vla_stop_after_distance",
+    "distance_m": 2.0,
+    "description": "走到电梯 C 门口并停下"
+  }
 }
 ```
+
+`stop_condition` 是执行器判断子目标何时结束的唯一依据，四类取值：
+
+- `vla_stop_after_distance`：VLA 说 stop **且**走够 `distance_m`。粗粒度、
+  以地标结尾的段落的默认规则。`distance_m` 同时是下限（提前 stop 会交回重规划）
+  和上限（超预算 30% 仍没等到 stop 也会交回），所以估计宁可略大。
+- `distance`：走够 `distance_m` 就停，不等 VLA。适合沿走廊直行的固定段落。
+- `steps`：执行固定步数。只用于既不需要识别地标、也不用判断转向是否到位的段落。
+- `vla_stop`：完全信任 VLA 的 stop。只用于几米内、外观极明确的目标。
+
+分解原则是**宁粗勿细**：模型写不出可判定停止条件的切分点会被自动并入前一段；
+用步数表示"转向完成"也会被并入（步数无法证明转到位）。
+近期的 dry-run 记录见 `runs/go2/`：`20260917-144205_coarse-merge` 里合并后的
+长段一直等不到 VLA 的 stop，共走 82 步、3 次耗尽 `max_steps` 硬失败；
+`20260917-150617_coarse-final` 用同一任务只走 33 步，超过预算就交回 Agno 重规划。
 
 Executor 发出的事件：
 

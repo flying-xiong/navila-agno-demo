@@ -56,6 +56,11 @@ class MockRobot:
         self.current_subgoal: SubGoal | None = None
         self.step = 0
         self.remaining_distance_m = 0.0
+        self._estimated_distance_m = 0.0
+        #: Distance actually covered since this subgoal started. It is a plain
+        #: accumulator on purpose: it must be able to exceed the supervisor's
+        #: estimate, otherwise an over-long segment can never be detected.
+        self.traveled_m = 0.0
         self.complete = False
         self._frames: deque[str] = deque([f"mock://frame/{self.step}"], maxlen=32)
         # Mission-scoped history: NaVILA's memory spans the whole trajectory,
@@ -83,7 +88,9 @@ class MockRobot:
         self.current_subgoal = subgoal
         self.step = 0
         self.complete = False
-        self.remaining_distance_m = subgoal.estimated_distance_m or 1.0
+        self._estimated_distance_m = subgoal.estimated_distance_m or 1.0
+        self.remaining_distance_m = self._estimated_distance_m
+        self.traveled_m = 0.0
         self._frames.clear()
         self._frames.append(f"mock://frame/{self.step}")
         self._subgoal_start = max(0, len(self._history) - 1)
@@ -102,12 +109,14 @@ class MockRobot:
             frame_path=self._frames[-1],
             obstacle=obstacle,
             remaining_distance_m=self.remaining_distance_m,
+            traveled_m=self.traveled_m,
         )
 
     def execute(self, action: MidLevelAction) -> RobotState:
         if action.action_type in {"move_forward", "move"}:
+            self.traveled_m += max(action.distance_m, 0.0)
             self.remaining_distance_m = max(
-                0.0, self.remaining_distance_m - max(action.distance_m, 0.0)
+                0.0, self._estimated_distance_m - self.traveled_m
             )
         self.step += 1
         self._record_frame()
@@ -121,6 +130,7 @@ class MockRobot:
 
     def mark_complete(self) -> None:
         self.complete = True
+        self.traveled_m = self._estimated_distance_m
         self.remaining_distance_m = 0.0
 
 
@@ -256,6 +266,9 @@ class Go2HttpRobot:
         self.step = 0
         self.remaining_distance_m = 0.0
         self._estimated_distance_m = 0.0
+        #: Real odometry when the robot reports a pose, otherwise the sum of the
+        #: commanded distances. Never clamped to the supervisor's estimate.
+        self.traveled_m = 0.0
         self._start_position: dict[str, Any] | None = None
         self.complete = False
         self._frames: deque[str] = deque(maxlen=32)
@@ -289,6 +302,7 @@ class Go2HttpRobot:
             else 1.0
         )
         self.remaining_distance_m = self._estimated_distance_m
+        self.traveled_m = 0.0
         self._start_position = None
         try:
             data = self._get_json("/state")
@@ -406,6 +420,7 @@ class Go2HttpRobot:
         position = _as_position(state_data.get("position", {"x": self.step}))
         if self._start_position is not None and not self.dry_run:
             traveled = _distance_between(self._start_position, position)
+            self.traveled_m = traveled
             self.remaining_distance_m = max(
                 0.0,
                 self._estimated_distance_m - traveled,
@@ -427,6 +442,7 @@ class Go2HttpRobot:
             frame_path=frame_path,
             obstacle=obstacle,
             remaining_distance_m=self.remaining_distance_m,
+            traveled_m=self.traveled_m,
         )
 
     def _send_action(self, action: MidLevelAction) -> None:
@@ -475,8 +491,9 @@ class Go2HttpRobot:
             self.dry_run
             or self._start_position is None
         ) and action.action_type in {"move_forward", "move"}:
+            self.traveled_m += max(action.distance_m, 0.0)
             self.remaining_distance_m = max(
-                0.0, self.remaining_distance_m - max(action.distance_m, 0.0)
+                0.0, self._estimated_distance_m - self.traveled_m
             )
         self.step += 1
         return self.observe()
@@ -489,4 +506,5 @@ class Go2HttpRobot:
 
     def mark_complete(self) -> None:
         self.complete = True
+        self.traveled_m = self._estimated_distance_m
         self.remaining_distance_m = 0.0

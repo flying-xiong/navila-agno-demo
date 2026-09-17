@@ -75,6 +75,9 @@ def annotation_for(
     step = int(record.get("step") or 0)
     max_steps = int(meta.get("max_steps") or 0)
     step_label = f"step {step}/{max_steps}" if max_steps else f"step {step}"
+    stop_text = str(meta.get("stop_condition") or "")
+    if stop_text:
+        step_label = f"{step_label}    停止条件：{stop_text}"
 
     action = _as_action(record)
     remaining = 0.0

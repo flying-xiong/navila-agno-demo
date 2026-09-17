@@ -24,6 +24,8 @@ from datetime import datetime
 from typing import Any, Callable, Optional, Protocol
 
 from .contracts import (
+    FIRST_STEP_STOP_MARGIN_M,
+    VLA_STOP_KINDS,
     EventType,
     ExecutionEvent,
     ExecutionOutcome,
@@ -327,6 +329,26 @@ class VLAExecutor:
         if callable(begin):
             begin()
 
+    def _complete(
+        self,
+        subgoal: SubGoal,
+        state: RobotState,
+        step: int,
+        reason: str,
+        trace: list[MidLevelAction],
+    ) -> ExecutionOutcome:
+        self.robot.mark_complete()
+        event = self._emit(
+            ExecutionEvent(
+                type=EventType.SUBGOAL_COMPLETED,
+                subgoal_id=subgoal.id,
+                message=f"完成子目标：{subgoal.instruction}（{reason}）",
+                step_count=step,
+                state=state,
+            )
+        )
+        return ExecutionOutcome(event=event, action_trace=trace)
+
     def _observation_frames(self) -> list[str]:
         if self.frame_memory == "recent":
             return self.robot.recent_frames(self.frame_buffer_size)
@@ -362,6 +384,7 @@ class VLAExecutor:
                 "battery": state.battery,
                 "obstacle": state.obstacle,
                 "remaining_distance_m": state.remaining_distance_m,
+                "traveled_m": state.traveled_m,
             },
         )
 
@@ -386,19 +409,33 @@ class VLAExecutor:
                 )
                 return ExecutionOutcome(event=event, action_trace=trace)
 
-            if self.robot.is_complete(subgoal, state):
+            # Conditions that only need odometry (distance / steps) can be met
+            # before asking the VLA anything, which saves an inference.
+            pre = subgoal.stop_condition.evaluate(
+                action_type=None,
+                traveled_m=state.traveled_m,
+                step=step - 1,
+                estimated_distance_m=subgoal.estimated_distance_m,
+            )
+            if pre.met:
+                return self._complete(subgoal, state, step, pre.reason, trace)
+
+            frames = self._observation_frames()
+            # No observation means no information. Never let a camera failure
+            # reach the policy: its only safe answer would be `stop`, which is
+            # indistinguishable from a real arrival.
+            if not frames:
                 event = self._emit(
                     ExecutionEvent(
-                        type=EventType.SUBGOAL_COMPLETED,
+                        type=EventType.UNCERTAIN,
                         subgoal_id=subgoal.id,
-                        message=f"完成子目标：{subgoal.instruction}",
+                        message="取不到相机画面，无法判断是否到达，请求重新规划。",
                         step_count=step,
                         state=state,
                     )
                 )
                 return ExecutionOutcome(event=event, action_trace=trace)
 
-            frames = self._observation_frames()
             raw_action = self.policy.predict(subgoal.instruction, frames, state)
             raw_text = (
                 raw_action
@@ -416,7 +453,10 @@ class VLAExecutor:
 
             trace.append(action)
             try:
-                self.robot.execute(action)
+                # execute() returns a fresh observation taken after the motion,
+                # so the stop condition is judged against the distance the
+                # robot has actually covered.
+                new_state = self.robot.execute(action)
             except RobotTransportError as exc:
                 record.command = getattr(self.robot, "last_command", None)
                 record.command_response = getattr(
@@ -438,54 +478,107 @@ class VLAExecutor:
             record.command_response = getattr(
                 self.robot, "last_command_response", None
             )
+            post_state = new_state if isinstance(new_state, RobotState) else state
+            decision = subgoal.stop_condition.evaluate(
+                action_type=action.action_type,
+                traveled_m=post_state.traveled_m,
+                step=step,
+                estimated_distance_m=subgoal.estimated_distance_m,
+            )
+            # Safety net for `vla_stop` subgoals. That kind trusts the VLA's
+            # `stop` without any distance guard, which is right for short,
+            # visually obvious targets -- but a `stop` on the very first step,
+            # while the supervisor still expects metres of ground to cover,
+            # means the split was too fine (or the target is not visible yet).
+            # Hand it back instead of declaring a fake arrival.
+            first_step_stop = (
+                not decision.premature
+                and action.action_type == "stop"
+                and step <= 1
+                and subgoal.stop_condition.kind in VLA_STOP_KINDS
+                and post_state.remaining_distance_m > FIRST_STEP_STOP_MARGIN_M
+            )
+            # A distance-guarded segment that has already walked past its
+            # budget without ever getting a `stop` is not arriving: either the
+            # target is further away than the supervisor thought, or it was
+            # passed. Hand it back instead of spending the whole step budget.
+            budget_m = subgoal.stop_condition.hand_back_after_m(
+                subgoal.estimated_distance_m
+            )
+            budget_exhausted = (
+                budget_m is not None
+                and not decision.met
+                and not decision.premature
+                and not first_step_stop
+                and post_state.traveled_m >= budget_m
+            )
+            if decision.met and not first_step_stop:
+                record.stop_reason = decision.reason
+            elif budget_exhausted:
+                record.stop_reason = f"距离预算已用完（{budget_m:.2f}m），仍未确认到达"
             self._emit_step(record)
 
-            if action.action_type == "stop":
-                instruction = subgoal.instruction.lower()
-                turn_only = "turn" in instruction and not any(
-                    keyword in instruction
-                    for keyword in ("walk", "move", "go ", "proceed", "forward")
-                )
-                if (
-                    step <= 1
-                    and state.remaining_distance_m > 1.0
-                    and not turn_only
-                ):
-                    event = self._emit(
-                        ExecutionEvent(
-                            type=EventType.UNCERTAIN,
-                            subgoal_id=subgoal.id,
-                            message=(
-                                "VLA 在第一步返回 stop，但估计剩余距离 "
-                                f"{state.remaining_distance_m:.2f}m，请求重新规划。"
-                            ),
-                            step_count=step,
-                            state=state,
-                        )
-                    )
-                    return ExecutionOutcome(event=event, action_trace=trace)
-                self.robot.mark_complete()
+            if decision.premature:
                 event = self._emit(
                     ExecutionEvent(
-                        type=EventType.SUBGOAL_COMPLETED,
+                        type=EventType.UNCERTAIN,
                         subgoal_id=subgoal.id,
-                        message=(
-                            "VLA 返回 stop，且剩余距离已接近目标，"
-                            "子目标完成。"
-                        ),
+                        message=f"{decision.reason}，请求重新规划。",
                         step_count=step,
-                        state=state,
+                        state=post_state,
                     )
                 )
                 return ExecutionOutcome(event=event, action_trace=trace)
 
+            if first_step_stop:
+                event = self._emit(
+                    ExecutionEvent(
+                        type=EventType.UNCERTAIN,
+                        subgoal_id=subgoal.id,
+                        message=(
+                            "VLA 在第一步返回 stop，但估计仍有 "
+                            f"{post_state.remaining_distance_m:.2f}m 未走完，"
+                            "该子目标可能切分过细，请求合并后重新规划。"
+                        ),
+                        step_count=step,
+                        state=post_state,
+                    )
+                )
+                return ExecutionOutcome(event=event, action_trace=trace)
+
+            if budget_exhausted:
+                event = self._emit(
+                    ExecutionEvent(
+                        type=EventType.UNCERTAIN,
+                        subgoal_id=subgoal.id,
+                        message=(
+                            f"已前进 {post_state.traveled_m:.2f}m，超过该子目标"
+                            f"的距离预算 {budget_m:.2f}m，但 VLA 始终没有返回 stop，"
+                            "目标可能未识别到，请求重新规划。"
+                        ),
+                        step_count=step,
+                        state=post_state,
+                    )
+                )
+                return ExecutionOutcome(event=event, action_trace=trace)
+
+            if decision.met:
+                return self._complete(
+                    subgoal, post_state, step, decision.reason, trace
+                )
+
+        final_state = self.robot.observe()
         event = self._emit(
             ExecutionEvent(
                 type=EventType.SUBGOAL_FAILED,
                 subgoal_id=subgoal.id,
-                message=f"超过 max_steps={subgoal.max_steps}，子目标失败。",
+                message=(
+                    f"超过 max_steps={subgoal.max_steps}，子目标失败。"
+                    f"停止条件未满足：{subgoal.stop_condition.describe()}"
+                    f"（已前进 {final_state.traveled_m:.2f}m）"
+                ),
                 step_count=subgoal.max_steps,
-                state=self.robot.observe(),
+                state=final_state,
             )
         )
         return ExecutionOutcome(event=event, action_trace=trace)

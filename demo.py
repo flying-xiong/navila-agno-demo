@@ -198,10 +198,13 @@ def main() -> None:
             "instruction": subgoal.instruction,
             "max_steps": subgoal.max_steps,
             "estimated_distance_m": subgoal.estimated_distance_m,
+            "stop_condition": subgoal.stop_condition.describe(),
+            "stop_kind": subgoal.stop_condition.kind,
         }
         print(
             f"  [subgoal] {subgoal.id}: {subgoal.instruction} "
-            f"(max_steps={subgoal.max_steps}, est={subgoal.estimated_distance_m})"
+            f"(max_steps={subgoal.max_steps}, est={subgoal.estimated_distance_m}, "
+            f"stop={subgoal.stop_condition.describe()})"
         )
 
     artifacts = RunArtifacts.create(
