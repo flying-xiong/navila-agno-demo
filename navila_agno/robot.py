@@ -11,6 +11,10 @@ from typing import Any, Protocol
 from .contracts import MidLevelAction, RobotState, SubGoal
 
 
+#: Hard ceiling on yaw rate accepted by the Go2 bridge (rad/s).
+MAX_YAW_RATE_RAD_S = 5.0
+
+
 class RobotTransportError(RuntimeError):
     """Raised when the HTTP bridge cannot be reached after retries."""
 
@@ -103,6 +107,11 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _clamp_yaw_rate(vyaw_rad_s: float) -> float:
+    """Keep the commanded yaw rate inside the bridge accepted range."""
+    return max(-MAX_YAW_RATE_RAD_S, min(MAX_YAW_RATE_RAD_S, vyaw_rad_s))
+
+
 def action_to_go2_command(
     action: MidLevelAction,
     forward_speed_mps: float = 0.30,
@@ -124,7 +133,10 @@ def action_to_go2_command(
     if action.action_type == "move":
         vx = max(-1.0, min(1.0, action.distance_m / 0.375)) * max_linear_speed_mps
         vy = max(-1.0, min(1.0, action.lateral_m / 0.375)) * max_lateral_speed_mps
-        vyaw = max(-1.0, min(1.0, action.angle_deg / 9.0)) * max_yaw_speed_deg_per_s
+        vyaw = _clamp_yaw_rate(
+            max(-1.0, min(1.0, action.angle_deg / 9.0))
+            * math.radians(max_yaw_speed_deg_per_s)
+        )
         return {
             "vx": vx,
             "vy": vy,
@@ -145,12 +157,12 @@ def action_to_go2_command(
     if action.action_type in {"turn_left", "turn_right"}:
         direction = -1.0 if action.action_type == "turn_left" else 1.0
         angle_deg = max(abs(action.angle_deg), 0.1)
-        yaw_speed = max(5.0, min(max_yaw_speed_deg_per_s, max_yaw_speed_deg_per_s))
+        yaw_speed_deg = max(5.0, max_yaw_speed_deg_per_s)
         return {
             "vx": 0.0,
             "vy": 0.0,
-            "vyaw": direction * yaw_speed,
-            "duration_sec": max(0.1, min(5.0, angle_deg / yaw_speed)),
+            "vyaw": _clamp_yaw_rate(direction * math.radians(yaw_speed_deg)),
+            "duration_sec": max(0.1, min(5.0, angle_deg / yaw_speed_deg)),
         }
 
     return {"vx": 0.0, "vy": 0.0, "vyaw": 0.0, "duration_sec": 0.0}
@@ -265,6 +277,11 @@ class Go2HttpRobot:
                 )
                 response.raise_for_status()
                 return response
+            except httpx.HTTPStatusError as exc:
+                body = exc.response.text[:200]
+                raise RobotTransportError(
+                    f"{method} {path} 返回 HTTP {exc.response.status_code}: {body}"
+                ) from exc
             except (
                 httpx.ConnectError,
                 httpx.ConnectTimeout,

@@ -285,6 +285,7 @@ class VLAExecutor:
     frame_buffer_size: int = 8
     on_event: Optional[Callable[[ExecutionEvent], None]] = None
     on_step: Optional[Callable[[StepRecord], None]] = None
+    on_subgoal: Optional[Callable[[SubGoal], None]] = None
     _last_event: Optional[ExecutionEvent] = field(default=None, repr=False)
 
     def _emit(self, event: ExecutionEvent) -> ExecutionEvent:
@@ -327,6 +328,8 @@ class VLAExecutor:
 
     def execute(self, subgoal: SubGoal) -> ExecutionOutcome:
         self.robot.begin_subgoal(subgoal)
+        if self.on_subgoal is not None:
+            self.on_subgoal(subgoal)
         trace: list[MidLevelAction] = []
 
         for step in range(1, subgoal.max_steps + 1):

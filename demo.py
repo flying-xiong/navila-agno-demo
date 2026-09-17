@@ -148,6 +148,12 @@ def main() -> None:
             f"vla={record.raw_vla[:60]!r} -> {record.action_type}"
         )
 
+    def _on_subgoal(subgoal: object) -> None:
+        print(
+            f"  [subgoal] {subgoal.id}: {subgoal.instruction} "
+            f"(max_steps={subgoal.max_steps}, est={subgoal.estimated_distance_m})"
+        )
+
     artifacts = RunArtifacts.create(
         kind=args.robot,
         mission=args.mission,
@@ -176,6 +182,7 @@ def main() -> None:
         frame_buffer_size=args.frame_buffer_size,
         on_event=_on_event,
         on_step=_on_step,
+        on_subgoal=_on_subgoal,
     )
     supervisor = _make_supervisor(args.supervisor)
     runtime = MissionRuntime(supervisor=supervisor, executor=executor, memory=memory)

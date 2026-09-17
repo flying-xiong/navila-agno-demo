@@ -27,6 +27,7 @@ OBSTACLE_STOP_DISTANCE_M = float(os.getenv("GO2_OBSTACLE_STOP_DISTANCE_M", "0.6"
 FRAME_MAX_WIDTH = int(os.getenv("GO2_FRAME_MAX_WIDTH", "1280"))
 FRAME_JPEG_QUALITY = int(os.getenv("GO2_FRAME_JPEG_QUALITY", "80"))
 MOVE_WATCHDOG_GRACE_S = float(os.getenv("GO2_MOVE_WATCHDOG_GRACE_S", "0.5"))
+MOVE_REPEAT_PERIOD_S = float(os.getenv("GO2_MOVE_REPEAT_PERIOD_S", "0.05"))
 
 
 class MoveRequest(BaseModel):
@@ -147,9 +148,13 @@ class Go2SDK:
         watchdog.daemon = True
         watchdog.start()
         try:
-            move_rc = int(self._sport_client.Move(req.vx, req.vy, req.vyaw))
-            if req.duration_sec > 0:
-                time.sleep(req.duration_sec)
+            deadline = time.monotonic() + max(req.duration_sec, 0.0)
+            while True:
+                move_rc = int(self._sport_client.Move(req.vx, req.vy, req.vyaw))
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(MOVE_REPEAT_PERIOD_S, remaining))
         except Exception as exc:  # noqa: BLE001 - report SDK failure to client
             raise HTTPException(status_code=502, detail=f"Go2 Move 调用失败：{exc}") from exc
         finally:

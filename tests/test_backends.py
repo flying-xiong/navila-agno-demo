@@ -73,6 +73,7 @@ class Go2CommandTests(unittest.TestCase):
             MidLevelAction("turn_left", angle_deg=40.0)
         )
         self.assertLess(cmd["vyaw"], 0.0)
+        self.assertLessEqual(abs(cmd["vyaw"]), 5.0)
 
     def test_waypoint_clamping(self) -> None:
         cmd = action_to_go2_command(
