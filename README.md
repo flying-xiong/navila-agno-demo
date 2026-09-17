@@ -260,6 +260,9 @@ curl -w '\nhttp=%{http_code} size=%{size_download} time=%{time_total}\n' \
 - 建议 `ping` 丢包为 0%，`/health` 响应小于 1 秒。
 - 如果客户端报 `httpx.ConnectTimeout`，通常是 Go2 WiFi 丢包或 bridge 被阻塞，不是运动指令本身的问题。
 - Go2 端 bridge 会返回 `rc` 和 `stop_rc`；`rc != 0` 表示 SDK 拒绝了运动指令。
+- 客户端报 `HTTP 422` 说明 bridge 的 pydantic 校验没通过（例如 `vyaw` 超出
+  ±5 rad/s）。客户端已把响应体带进 `RobotTransportError`，错误信息里能看到
+  具体字段；注意转向角速度必须用 rad/s，不要直接填 deg/s。
 - 客户端对 `/state`、`/frame`、`/move` 默认重试 3 次；重试仍失败会触发 `safety_stop` 事件并调用 `/stop`。
 
 可用环境变量：
@@ -268,7 +271,13 @@ curl -w '\nhttp=%{http_code} size=%{size_download} time=%{time_total}\n' \
 export GO2_FRAME_MAX_WIDTH=1280      # 0 表示不缩放，降低 WiFi 带宽
 export GO2_FRAME_JPEG_QUALITY=80
 export GO2_MOVE_WATCHDOG_GRACE_S=0.5 # /move 卡住时的兜底停止时间
+export GO2_MOVE_REPEAT_PERIOD_S=0.05 # 周期重发 SportClient.Move() 的间隔
 ```
+
+`SportClient.Move()` 是 fire-and-forget：只发一次速度指令，机器人会在很短的
+时间窗口后自行衰减停下（表现为“说走 75 cm，实际只走了 25 cm”）。因此 bridge
+会在 `duration_sec` 内每 `GO2_MOVE_REPEAT_PERIOD_S` 重发一次同样的指令，
+保证整段位移执行完再 `StopMove()`。间隔越小动作越连贯，但 DDS 通信量越大。
 
 ## 运行产物与视频
 
