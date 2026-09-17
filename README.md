@@ -358,6 +358,13 @@ CJK 兜底字体（Droid Sans Fallback）不含任何拉丁字母和数字字形
 所有英文和数字渲染成方框；`navila_agno/overlay.py` 因此按字符在“拉丁字体”和
 “CJK 字体”之间切换，保证中英文都正常。
 
+依赖：`pillow`（已在 `requirements.txt`）。如果当前环境缺 Pillow，`demo.py` 会打印
+提示并自动退回无字幕的固定帧率合成，不会中断任务；补装即可：
+
+```bash
+python -m pip install pillow
+```
+
 默认开启视频合成，可用参数调整：
 
 ```bash

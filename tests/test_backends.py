@@ -1,6 +1,7 @@
 import unittest
 import tempfile
 import os
+from pathlib import Path
 
 from navila_agno.contracts import MidLevelAction, RobotState, SubGoal
 from navila_agno.robot import Go2HttpRobot, MockRobot, action_to_go2_command
@@ -121,6 +122,25 @@ class RobotLifecycleTests(unittest.TestCase):
             )
             state = robot.observe()
         self.assertIsInstance(state, RobotState)
+
+    def test_observe_falls_back_to_previous_frame(self) -> None:
+        """A failed /frame must not hand the VLA an empty observation."""
+        with tempfile.TemporaryDirectory() as frame_dir:
+            robot = Go2HttpRobot(
+                endpoint="http://127.0.0.1:1",
+                dry_run=True,
+                timeout_s=0.2,
+                max_retries=1,
+                connect_timeout_s=0.2,
+                frame_dir=frame_dir,
+            )
+            # Pretend an earlier step captured a frame successfully.
+            previous = Path(frame_dir) / "sg-1_step0000.jpg"
+            previous.write_bytes(b"jpeg")
+            robot._history.append(str(previous))
+            robot._frames.append(str(previous))
+            state = robot.observe()
+        self.assertEqual(state.frame_path, str(previous))
 
 
 if __name__ == "__main__":

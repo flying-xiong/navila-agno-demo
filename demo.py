@@ -13,7 +13,6 @@ except ImportError:  # optional dependency; mock demo does not need it
         return None
 
 from navila_agno.artifacts import RunArtifacts, compose_video
-from navila_agno.video import build_timeline, render_video
 from navila_agno.contracts import ExecutionEvent, StepRecord
 from navila_agno.memory import EpisodeMemory
 from navila_agno.robot import Go2HttpRobot, MockRobot
@@ -258,6 +257,17 @@ def main() -> None:
         total_subgoals = len(subgoal_meta)
         for meta in subgoal_meta.values():
             meta["total"] = total_subgoals
+        if args.video_overlay:
+            try:
+                from navila_agno.video import build_timeline, render_video
+            except ImportError as exc:
+                # Pillow is only needed for the burned-in subtitles; a missing
+                # optional dependency must not abort the whole mission.
+                print(
+                    f"[demo] 字幕视频不可用（{exc}）。"
+                    "安装后重试：python -m pip install pillow"
+                )
+                args.video_overlay = False
         if args.video_overlay:
             timeline = build_timeline(
                 recorded_frames,

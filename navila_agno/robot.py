@@ -322,9 +322,20 @@ class Go2HttpRobot:
                 return response
             except httpx.HTTPStatusError as exc:
                 body = exc.response.text[:200]
-                raise RobotTransportError(
-                    f"{method} {path} 返回 HTTP {exc.response.status_code}: {body}"
-                ) from exc
+                status = exc.response.status_code
+                if status < 500:
+                    # 4xx means the request itself is wrong (e.g. a field that
+                    # fails bridge validation); retrying cannot help.
+                    raise RobotTransportError(
+                        f"{method} {path} 返回 HTTP {status}: {body}"
+                    ) from exc
+                # 5xx is the bridge telling us it is not ready yet (the camera
+                # frame buffer, for instance). Retry like a transport error.
+                last_error = RobotTransportError(
+                    f"{method} {path} 返回 HTTP {status}: {body}"
+                )
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_backoff_s * attempt)
             except (
                 httpx.ConnectError,
                 httpx.ConnectTimeout,
@@ -351,6 +362,7 @@ class Go2HttpRobot:
         try:
             response = self._request("GET", "/frame")
             if not response.content:
+                print("[go2] /frame 返回空图像，沿用上一帧")
                 return ""
             name = (
                 f"{self.current_subgoal.id if self.current_subgoal else 'mission'}"
@@ -366,10 +378,11 @@ class Go2HttpRobot:
                 self.recorded_frames.append(resolved)
             return resolved
         except Exception as exc:  # noqa: BLE001 - a missing frame must not abort
-            # Staying silent here is dangerous: the VLA then sees an empty
-            # history and NaVILA answers "stop", which looks like the subgoal
-            # finished. Surface it instead.
-            print(f"[go2] 取帧失败（VLA 将以空历史推理）：{type(exc).__name__}: {exc}")
+            # Silent failures here are dangerous: with no frame at all the VLA
+            # reasons over nothing and answers "stop", which looks exactly like
+            # a finished subgoal. Surface it; observe() falls back to the last
+            # frame it still holds.
+            print(f"[go2] 取帧失败，沿用上一帧：{type(exc).__name__}: {exc}")
             return ""
 
     def observe(self) -> RobotState:
@@ -381,7 +394,15 @@ class Go2HttpRobot:
         except Exception:
             state_data = {}
 
-        frame_path = self._fetch_frame() or (self._frames[-1] if self._frames else "")
+        # Fall back to the most recent frame we still hold. Handing the VLA an
+        # empty path makes it reason over nothing and answer "stop", which
+        # looks exactly like a finished subgoal.
+        frame_path = self._fetch_frame()
+        if not frame_path:
+            for candidate in (self._frames, self._history):
+                if candidate:
+                    frame_path = candidate[-1]
+                    break
         position = _as_position(state_data.get("position", {"x": self.step}))
         if self._start_position is not None and not self.dry_run:
             traveled = _distance_between(self._start_position, position)

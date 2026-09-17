@@ -165,6 +165,10 @@ class HttpVLAClient:
         import httpx
 
         if not image_paths:
+            # No observation means no information; "stop" is the only safe
+            # command but it must be visible in the logs, because the executor
+            # cannot tell it apart from a real "arrived" answer.
+            print(f"[{self.backend}] 观测帧为空，返回 stop（疑似取帧失败，不是真的到达）")
             return "stop"
 
         assert self.payload_builder is not None
